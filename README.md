@@ -40,7 +40,7 @@ chmod +x build-aidata-adt1061.sh && chmod +x scripts/* && chmod +x arch/arm64/ke
 ## Credits ##
 
 - Linux Kernel Developers
-- Spreadtrum/Unisoc Develop
+- Spreadtrum/Unisoc Developer
 - strongtz/linux-sprd
 - mmetem55
 

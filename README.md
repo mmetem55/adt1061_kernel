@@ -16,7 +16,7 @@ Use Ubuntu 20.04 LTS for the best result
 
 ### Clone repository
 ```bash
-git clone https://github.com/mmetem55/aidata-adt1061-kernel.git && cd aidata-adt1061-kernel
+git clone https://github.com/mmetem55/adt1061-kernel.git && cd adt1061-kernel
 ```
 
 ### Download and extract the prebuilt toolchain

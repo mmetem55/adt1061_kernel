@@ -1,16 +1,12 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  *  Parallel port to Walkera WK-0701 TX joystick
  *
  *  Copyright (c) 2008 Peter Popovec
  *
- *  More about driver:  <file:Documentation/input/walkera0701.txt>
+ *  More about driver:  <file:Documentation/input/devices/walkera0701.rst>
  */
 
-/*
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 as published by
- * the Free Software Foundation.
-*/
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
@@ -297,18 +293,6 @@ static struct parport_driver walkera0701_parport_driver = {
 	.name = "walkera0701",
 	.match_port = walkera0701_attach,
 	.detach = walkera0701_detach,
-	.devmodel = true,
 };
 
-static int __init walkera0701_init(void)
-{
-	return parport_register_driver(&walkera0701_parport_driver);
-}
-
-static void __exit walkera0701_exit(void)
-{
-	parport_unregister_driver(&walkera0701_parport_driver);
-}
-
-module_init(walkera0701_init);
-module_exit(walkera0701_exit);
+module_parport_driver(walkera0701_parport_driver);

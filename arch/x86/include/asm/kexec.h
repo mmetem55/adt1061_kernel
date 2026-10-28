@@ -16,15 +16,16 @@
 # define PAGES_NR		4
 #endif
 
+# define KEXEC_CONTROL_PAGE_SIZE	4096
 # define KEXEC_CONTROL_CODE_MAX_SIZE	2048
 
 #ifndef __ASSEMBLY__
 
 #include <linux/string.h>
+#include <linux/kernel.h>
 
 #include <asm/page.h>
 #include <asm/ptrace.h>
-#include <asm/bootparam.h>
 
 struct kimage;
 
@@ -43,7 +44,6 @@ struct kimage;
 /* Maximum address we can use for the control code buffer */
 # define KEXEC_CONTROL_MEMORY_LIMIT TASK_SIZE
 
-# define KEXEC_CONTROL_PAGE_SIZE	4096
 
 /* The native architecture */
 # define KEXEC_ARCH KEXEC_ARCH_386
@@ -58,32 +58,9 @@ struct kimage;
 /* Maximum address we can use for the control pages */
 # define KEXEC_CONTROL_MEMORY_LIMIT     (MAXMEM-1)
 
-/* Allocate one page for the pdp and the second for the code */
-# define KEXEC_CONTROL_PAGE_SIZE  (4096UL + 4096UL)
-
 /* The native architecture */
 # define KEXEC_ARCH KEXEC_ARCH_X86_64
 #endif
-
-/* Memory to backup during crash kdump */
-#define KEXEC_BACKUP_SRC_START	(0UL)
-#define KEXEC_BACKUP_SRC_END	(640 * 1024UL)	/* 640K */
-
-/*
- * CPU does not save ss and sp on stack if execution is already
- * running in kernel mode at the time of NMI occurrence. This code
- * fixes it.
- */
-static inline void crash_fixup_ss_esp(struct pt_regs *newregs,
-				      struct pt_regs *oldregs)
-{
-#ifdef CONFIG_X86_32
-	newregs->sp = (unsigned long)&(oldregs->sp);
-	asm volatile("xorl %%eax, %%eax\n\t"
-		     "movw %%ss, %%ax\n\t"
-		     :"=a"(newregs->ss));
-#endif
-}
 
 /*
  * This function is responsible for capturing register states if coming
@@ -95,7 +72,6 @@ static inline void crash_setup_regs(struct pt_regs *newregs,
 {
 	if (oldregs) {
 		memcpy(newregs, oldregs, sizeof(*newregs));
-		crash_fixup_ss_esp(newregs, oldregs);
 	} else {
 #ifdef CONFIG_X86_32
 		asm volatile("movl %%ebx,%0" : "=m"(newregs->bx));
@@ -132,7 +108,7 @@ static inline void crash_setup_regs(struct pt_regs *newregs,
 		asm volatile("movl %%cs, %%eax;" :"=a"(newregs->cs));
 		asm volatile("pushfq; popq %0" :"=m"(newregs->flags));
 #endif
-		newregs->ip = (unsigned long)current_text_addr();
+		newregs->ip = _THIS_IP_;
 	}
 }
 
@@ -149,7 +125,7 @@ relocate_kernel(unsigned long indirection_page,
 		unsigned long page_list,
 		unsigned long start_address,
 		unsigned int preserve_context,
-		unsigned int sme_active);
+		unsigned int host_mem_enc_active);
 #endif
 
 #define ARCH_HAS_KIMAGE_ARCH
@@ -166,21 +142,23 @@ struct kimage_arch {
 };
 #else
 struct kimage_arch {
+	/*
+	 * This is a kimage control page, as it must not overlap with either
+	 * source or destination address ranges.
+	 */
+	pgd_t *pgd;
+	/*
+	 * The virtual mapping of the control code page itself is used only
+	 * during the transition, while the current kernel's pages are all
+	 * in place. Thus the intermediate page table pages used to map it
+	 * are not control pages, but instead just normal pages obtained
+	 * with get_zeroed_page(). And have to be tracked (below) so that
+	 * they can be freed.
+	 */
 	p4d_t *p4d;
 	pud_t *pud;
 	pmd_t *pmd;
 	pte_t *pte;
-	/* Details of backup region */
-	unsigned long backup_src_start;
-	unsigned long backup_src_sz;
-
-	/* Physical address of backup segment */
-	unsigned long backup_load_addr;
-
-	/* Core ELF header buffer */
-	void *elf_headers;
-	unsigned long elf_headers_sz;
-	unsigned long elf_load_addr;
 };
 #endif /* CONFIG_X86_32 */
 
@@ -217,11 +195,37 @@ extern int arch_kexec_post_alloc_pages(void *vaddr, unsigned int pages,
 extern void arch_kexec_pre_free_pages(void *vaddr, unsigned int pages);
 #define arch_kexec_pre_free_pages arch_kexec_pre_free_pages
 
+void arch_kexec_protect_crashkres(void);
+#define arch_kexec_protect_crashkres arch_kexec_protect_crashkres
+
+void arch_kexec_unprotect_crashkres(void);
+#define arch_kexec_unprotect_crashkres arch_kexec_unprotect_crashkres
+
+#ifdef CONFIG_KEXEC_FILE
+struct purgatory_info;
+int arch_kexec_apply_relocations_add(struct purgatory_info *pi,
+				     Elf_Shdr *section,
+				     const Elf_Shdr *relsec,
+				     const Elf_Shdr *symtab);
+#define arch_kexec_apply_relocations_add arch_kexec_apply_relocations_add
+
+int arch_kimage_file_post_load_cleanup(struct kimage *image);
+#define arch_kimage_file_post_load_cleanup arch_kimage_file_post_load_cleanup
+#endif
 #endif
 
-typedef void crash_vmclear_fn(void);
-extern crash_vmclear_fn __rcu *crash_vmclear_loaded_vmcss;
 extern void kdump_nmi_shootdown_cpus(void);
+
+#ifdef CONFIG_CRASH_HOTPLUG
+void arch_crash_handle_hotplug_event(struct kimage *image, void *arg);
+#define arch_crash_handle_hotplug_event arch_crash_handle_hotplug_event
+
+int arch_crash_hotplug_support(struct kimage *image, unsigned long kexec_flags);
+#define arch_crash_hotplug_support arch_crash_hotplug_support
+
+unsigned int arch_crash_get_elfcorehdr_size(void);
+#define crash_get_elfcorehdr_size arch_crash_get_elfcorehdr_size
+#endif
 
 #endif /* __ASSEMBLY__ */
 

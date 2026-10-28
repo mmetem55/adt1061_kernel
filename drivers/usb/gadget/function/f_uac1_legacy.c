@@ -1,12 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0+
 /*
  * f_audio.c -- USB Audio class function driver
   *
  * Copyright (C) 2008 Bryan Wu <cooloney@kernel.org>
  * Copyright (C) 2008 Analog Devices, Inc
- *
- * Enter bugs at http://blackfin.uclinux.org/
- *
- * Licensed under the GPL-2 or later.
  */
 
 #include <linux/slab.h>
@@ -57,8 +54,8 @@ static struct uac1_ac_header_descriptor_1 ac_header_desc = {
 	.bLength =		UAC_DT_AC_HEADER_LENGTH,
 	.bDescriptorType =	USB_DT_CS_INTERFACE,
 	.bDescriptorSubtype =	UAC_HEADER,
-	.bcdADC =		__constant_cpu_to_le16(0x0100),
-	.wTotalLength =		__constant_cpu_to_le16(UAC_DT_TOTAL_LENGTH),
+	.bcdADC =		cpu_to_le16(0x0100),
+	.wTotalLength =		cpu_to_le16(UAC_DT_TOTAL_LENGTH),
 	.bInCollection =	F_AUDIO_NUM_INTERFACES,
 	.baInterfaceNr = {
 	/* Interface number of the first AudioStream interface */
@@ -186,7 +183,7 @@ static struct uac_iso_endpoint_descriptor as_iso_out_desc = {
 	.bDescriptorSubtype =	UAC_EP_GENERAL,
 	.bmAttributes = 	1,
 	.bLockDelayUnits =	1,
-	.wLockDelay =		__constant_cpu_to_le16(1),
+	.wLockDelay =		cpu_to_le16(1),
 };
 
 static struct usb_descriptor_header *f_audio_desc[] = {
@@ -339,7 +336,9 @@ static int f_audio_out_ep_complete(struct usb_ep *ep, struct usb_request *req)
 
 	/* Copy buffer is full, add it to the play_queue */
 	if (audio_buf_size - copy_buf->actual < req->actual) {
+		spin_lock_irq(&audio->lock);
 		list_add_tail(&copy_buf->list, &audio->play_queue);
+		spin_unlock_irq(&audio->lock);
 		schedule_work(&audio->playback_work);
 		copy_buf = f_audio_buffer_alloc(audio_buf_size);
 		if (IS_ERR(copy_buf))
@@ -361,19 +360,46 @@ static int f_audio_out_ep_complete(struct usb_ep *ep, struct usb_request *req)
 static void f_audio_complete(struct usb_ep *ep, struct usb_request *req)
 {
 	struct f_audio *audio = req->context;
-	int status = req->status;
-	u32 data = 0;
 	struct usb_ep *out_ep = audio->out_ep;
 
-	switch (status) {
-
-	case 0:				/* normal completion? */
-		if (ep == out_ep)
+	switch (req->status) {
+	case 0:
+		if (ep == out_ep) {
 			f_audio_out_ep_complete(ep, req);
-		else if (audio->set_con) {
-			memcpy(&data, req->buf, req->length);
-			audio->set_con->set(audio->set_con, audio->set_cmd,
-					le16_to_cpu(data));
+		} else if (audio->set_con) {
+			struct usb_audio_control *con = audio->set_con;
+			u8 type = con->type;
+			u32 data;
+			bool valid_request = false;
+
+			switch (type) {
+			case UAC_FU_MUTE: {
+				u8 value;
+
+				if (req->actual == sizeof(value)) {
+					memcpy(&value, req->buf, sizeof(value));
+					data = value;
+					valid_request = true;
+				}
+				break;
+			}
+			case UAC_FU_VOLUME: {
+				__le16 value;
+
+				if (req->actual == sizeof(value)) {
+					memcpy(&value, req->buf, sizeof(value));
+					data = le16_to_cpu(value);
+					valid_request = true;
+				}
+				break;
+			}
+			}
+
+			if (valid_request)
+				con->set(con, audio->set_cmd, data);
+			else
+				usb_ep_set_halt(ep);
+
 			audio->set_con = NULL;
 		}
 		break;
@@ -755,8 +781,6 @@ f_audio_bind(struct usb_configuration *c, struct usb_function *f)
 	audio->out_ep = ep;
 	audio->out_ep->desc = &as_out_ep_desc;
 
-	status = -ENOMEM;
-
 	/* copy descriptors, and track endpoint copies */
 	status = usb_assign_descriptors(f, f_audio_desc, f_audio_desc, NULL,
 					NULL);
@@ -921,7 +945,7 @@ static struct configfs_attribute *f_uac1_attrs[] = {
 	NULL,
 };
 
-static struct config_item_type f_uac1_func_type = {
+static const struct config_item_type f_uac1_func_type = {
 	.ct_item_ops	= &f_uac1_item_ops,
 	.ct_attrs	= f_uac1_attrs,
 	.ct_owner	= THIS_MODULE,
@@ -1017,5 +1041,6 @@ static struct usb_function *f_audio_alloc(struct usb_function_instance *fi)
 }
 
 DECLARE_USB_FUNCTION_INIT(uac1_legacy, f_audio_alloc_inst, f_audio_alloc);
+MODULE_DESCRIPTION("USB Audio class function driver");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Bryan Wu");

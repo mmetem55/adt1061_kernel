@@ -56,7 +56,7 @@ static enum odd_mech_type zpodd_get_mech_type(struct ata_device *dev)
 	unsigned int ret;
 	struct rm_feature_desc *desc;
 	struct ata_taskfile tf;
-	static const char cdb[] = {  GPCMD_GET_CONFIGURATION,
+	static const char cdb[ATAPI_CDB_LEN] = {  GPCMD_GET_CONFIGURATION,
 			2,      /* only 1 feature descriptor requested */
 			0, 3,   /* 3, removable medium feature */
 			0, 0, 0,/* reserved */
@@ -112,7 +112,7 @@ static bool zpready(struct ata_device *dev)
 	if (!ret || sense_key != NOT_READY)
 		return false;
 
-	sense_buf = dev->link->ap->sector_buf;
+	sense_buf = dev->sector_buf;
 	ret = atapi_eh_request_sense(dev, sense_buf, sense_key);
 	if (ret)
 		return false;

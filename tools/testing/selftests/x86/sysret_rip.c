@@ -1,15 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * sigreturn.c - tests that x86 avoids Intel SYSRET pitfalls
  * Copyright (c) 2014-2016 Andrew Lutomirski
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
  */
 
 #define _GNU_SOURCE
@@ -30,21 +22,13 @@
 #include <sys/mman.h>
 #include <assert.h>
 
-
-asm (
-	".pushsection \".text\", \"ax\"\n\t"
-	".balign 4096\n\t"
-	"test_page: .globl test_page\n\t"
-	".fill 4094,1,0xcc\n\t"
-	"test_syscall_insn:\n\t"
-	"syscall\n\t"
-	".ifne . - test_page - 4096\n\t"
-	".error \"test page is not one page long\"\n\t"
-	".endif\n\t"
-	".popsection"
-    );
-
+/*
+ * These items are in clang_helpers_64.S, in order to avoid clang inline asm
+ * limitations:
+ */
+void test_syscall_ins(void);
 extern const char test_page[];
+
 static void const *current_test_page_addr = test_page;
 
 static void sethandler(int sig, void (*handler)(int, siginfo_t *, void *),

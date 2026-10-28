@@ -1,34 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * MUSB OTG driver debugfs support
  *
  * Copyright 2010 Nokia Corporation
  * Contact: Felipe Balbi <felipe.balbi@nokia.com>
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * version 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA
- * 02110-1301 USA
- *
- * THIS SOFTWARE IS PROVIDED "AS IS" AND ANY EXPRESS OR IMPLIED
- * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN
- * NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
- * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF
- * USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
- * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
- * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
  */
 
 #include <linux/module.h>
@@ -41,9 +16,6 @@
 
 #include "musb_core.h"
 #include "musb_debug.h"
-#ifdef CONFIG_USB_SPRD_DMA
-#include "sprd_musbhsdma.h"
-#endif
 
 struct musb_register_map {
 	char			*name;
@@ -57,19 +29,23 @@ static const struct musb_register_map musb_regmap[] = {
 	{ "Frame",	MUSB_FRAME,	16 },
 	{ "Index",	MUSB_INDEX,	8 },
 	{ "Testmode",	MUSB_TESTMODE,	8 },
+	{ "TxMaxPp",	MUSB_TXMAXP,	16 },
+	{ "TxCSRp",	MUSB_TXCSR,	16 },
+	{ "RxMaxPp",	MUSB_RXMAXP,	16 },
+	{ "RxCSR",	MUSB_RXCSR,	16 },
+	{ "RxCount",	MUSB_RXCOUNT,	16 },
 	{ "IntrRxE",	MUSB_INTRRXE,	16 },
 	{ "IntrTxE",	MUSB_INTRTXE,	16 },
 	{ "IntrUsbE",	MUSB_INTRUSBE,	8 },
 	{ "DevCtl",	MUSB_DEVCTL,	8 },
 	{ "VControl",	0x68,		32 },
-	{ "HWVers",	MUSB_HWVERS,	8 },
+	{ "HWVers",	MUSB_HWVERS,	16 },
 	{ "LinkInfo",	MUSB_LINKINFO,	8 },
 	{ "VPLen",	MUSB_VPLEN,	8 },
 	{ "HS_EOF1",	MUSB_HS_EOF1,	8 },
 	{ "FS_EOF1",	MUSB_FS_EOF1,	8 },
 	{ "LS_EOF1",	MUSB_LS_EOF1,	8 },
 	{ "SOFT_RST",	0x7F,		8 },
-#ifndef CONFIG_USB_SPRD_DMA
 	{ "DMA_CNTLch0",	0x204,	16 },
 	{ "DMA_ADDRch0",	0x208,	32 },
 	{ "DMA_COUNTch0",	0x20C,	32 },
@@ -94,8 +70,7 @@ static const struct musb_register_map musb_regmap[] = {
 	{ "DMA_CNTLch7",	0x274,	16 },
 	{ "DMA_ADDRch7",	0x278,	32 },
 	{ "DMA_COUNTch7",	0x27C,	32 },
-#endif
-#ifndef CONFIG_BLACKFIN
+	{ "ConfigData",	MUSB_CONFIGDATA,8 },
 	{ "BabbleCtl",	MUSB_BABBLE_CTL,8 },
 	{ "TxFIFOsz",	MUSB_TXFIFOSZ,	8 },
 	{ "RxFIFOsz",	MUSB_RXFIFOSZ,	8 },
@@ -103,100 +78,8 @@ static const struct musb_register_map musb_regmap[] = {
 	{ "RxFIFOadd",	MUSB_RXFIFOADD,	16 },
 	{ "EPInfo",	MUSB_EPINFO,	8 },
 	{ "RAMInfo",	MUSB_RAMINFO,	8 },
-	{ "RxDpktBufDis", MUSB_RX_DPKTBUFDIS, 16 },
-	{ "TxDpktBufDis", MUSB_TX_DPKTBUFDIS, 16 },
-#endif
 	{  }	/* Terminating Entry */
 };
-
-static const struct musb_register_map ep_regmap[] = {
-	{ "TxMaxP",	MUSB_TXMAXP,	16 },
-	{ "TxCSR",	MUSB_TXCSR,	16 },
-	{ "RxMaxP",	MUSB_RXMAXP,	16 },
-	{ "RxCSR",	MUSB_RXCSR,	16 },
-	{ "RxCount",	MUSB_RXCOUNT,	16 },
-	{ "TxType",	MUSB_TXTYPE,	8 },
-	{ "TxInterval", MUSB_TXINTERVAL, 8 },
-	{ "RxType",	MUSB_RXTYPE,	 8 },
-	{ "RxInterval", MUSB_RXINTERVAL, 8 },
-	{ "FIFOSize",	MUSB_FIFOSIZE,	 8 },
-};
-
-#define MUSB_EPN_BASE(n)	(0x100 + (n) * 0x10)
-static void musb_ep_regdump(struct seq_file *s)
-{
-	struct musb *musb = s->private;
-	u32 offset;
-	int i, j;
-
-	for (i = 0; i < MUSB_C_NUM_EPS; ++i) {
-		seq_printf(s, "%s%02d %s\n", "Endpoint", i, "Registers:");
-		for (j = 0; j < ARRAY_SIZE(ep_regmap); ++j) {
-			offset = MUSB_EPN_BASE(i) + ep_regmap[j].offset;
-			switch (ep_regmap[j].size) {
-			case 8:
-				seq_printf(s, "%-12s: 0x%02x\n",
-					   ep_regmap[j].name,
-					   musb_readb(musb->mregs, offset));
-				break;
-			case 16:
-				seq_printf(s, "%-12s: 0x%04x\n",
-					   ep_regmap[j].name,
-					   musb_readw(musb->mregs, offset));
-				break;
-			case 32:
-				seq_printf(s, "%-12s: 0x%08x\n",
-					   ep_regmap[j].name,
-					   musb_readl(musb->mregs, offset));
-				break;
-			}
-		}
-	}
-}
-
-#ifdef CONFIG_USB_SPRD_DMA
-static const struct musb_register_map dma_regmap[] = {
-	{ "Pause",	MUSB_DMA_PAUSE,	32 },
-	{ "Cfg",	MUSB_DMA_CFG,	32 },
-	{ "Intr",	MUSB_DMA_INTR,	32 },
-	{ "Addr",	MUSB_DMA_ADDR,	32 },
-	{ "Len",	MUSB_DMA_LEN,	32 },
-	{ "LlistPrt",	MUSB_DMA_LLIST_PTR, 32 },
-	{ "AddrH",	MUSB_DMA_ADDR_H, 32 },
-	{ "Req",	MUSB_DMA_REQ,	32 },
-};
-
-static void musb_sprd_dma_regdump(struct seq_file *s)
-{
-	struct musb *musb = s->private;
-	u32 offset;
-	int i, j;
-
-	for (i = 1; i <= MUSB_DMA_CHANNELS; ++i) {
-		seq_printf(s, "%s%d %s\n", "DMA Chn", i, "Registers:");
-		for (j = 0; j < ARRAY_SIZE(dma_regmap); ++j) {
-			offset = MUSB_DMA_CHN_BASE(i) + dma_regmap[j].offset;
-			switch (dma_regmap[j].size) {
-			case 8:
-				seq_printf(s, "%-12s: 0x%02x\n",
-					   dma_regmap[j].name,
-					   musb_readb(musb->mregs, offset));
-				break;
-			case 16:
-				seq_printf(s, "%-12s: 0x%04x\n",
-					   dma_regmap[j].name,
-					   musb_readw(musb->mregs, offset));
-				break;
-			case 32:
-				seq_printf(s, "%-12s: 0x%08x\n",
-					   dma_regmap[j].name,
-					   musb_readl(musb->mregs, offset));
-				break;
-			}
-		}
-	}
-}
-#endif
 
 static int musb_regdump_show(struct seq_file *s, void *unused)
 {
@@ -209,34 +92,25 @@ static int musb_regdump_show(struct seq_file *s, void *unused)
 	for (i = 0; i < ARRAY_SIZE(musb_regmap); i++) {
 		switch (musb_regmap[i].size) {
 		case 8:
-			seq_printf(s, "%-12s: 0x%02x\n", musb_regmap[i].name,
+			seq_printf(s, "%-12s: %02x\n", musb_regmap[i].name,
 					musb_readb(musb->mregs, musb_regmap[i].offset));
 			break;
 		case 16:
-			seq_printf(s, "%-12s: 0x%04x\n", musb_regmap[i].name,
+			seq_printf(s, "%-12s: %04x\n", musb_regmap[i].name,
 					musb_readw(musb->mregs, musb_regmap[i].offset));
 			break;
 		case 32:
-			seq_printf(s, "%-12s: 0x%08x\n", musb_regmap[i].name,
+			seq_printf(s, "%-12s: %08x\n", musb_regmap[i].name,
 					musb_readl(musb->mregs, musb_regmap[i].offset));
 			break;
 		}
 	}
 
-	musb_ep_regdump(s);
-#ifdef CONFIG_USB_SPRD_DMA
-	musb_sprd_dma_regdump(s);
-#endif
-
 	pm_runtime_mark_last_busy(musb->controller);
 	pm_runtime_put_autosuspend(musb->controller);
 	return 0;
 }
-
-static int musb_regdump_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, musb_regdump_show, inode->i_private);
-}
+DEFINE_SHOW_ATTRIBUTE(musb_regdump);
 
 static int musb_test_mode_show(struct seq_file *s, void *unused)
 {
@@ -281,13 +155,6 @@ static int musb_test_mode_show(struct seq_file *s, void *unused)
 	return 0;
 }
 
-static const struct file_operations musb_regdump_fops = {
-	.open			= musb_regdump_open,
-	.read			= seq_read,
-	.llseek			= seq_lseek,
-	.release		= single_release,
-};
-
 static int musb_test_mode_open(struct inode *inode, struct file *file)
 {
 	return single_open(file, musb_test_mode_show, inode->i_private);
@@ -301,6 +168,11 @@ static ssize_t musb_test_mode_write(struct file *file,
 	u8			test;
 	char			buf[24];
 
+	memset(buf, 0x00, sizeof(buf));
+
+	if (copy_from_user(buf, ubuf, min_t(size_t, sizeof(buf) - 1, count)))
+		return -EFAULT;
+
 	pm_runtime_get_sync(musb->controller);
 	test = musb_readb(musb->mregs, MUSB_TESTMODE);
 	if (test) {
@@ -308,11 +180,6 @@ static ssize_t musb_test_mode_write(struct file *file,
 			"Please do USB Bus Reset to start a new test.\n");
 		goto ret;
 	}
-
-	memset(buf, 0x00, sizeof(buf));
-
-	if (copy_from_user(buf, ubuf, min_t(size_t, sizeof(buf) - 1, count)))
-		return -EFAULT;
 
 	if (strstarts(buf, "force host full-speed"))
 		test = MUSB_TEST_FORCE_HOST | MUSB_TEST_FORCE_FS;
@@ -368,7 +235,7 @@ static int musb_softconnect_show(struct seq_file *s, void *unused)
 	u8		reg;
 	int		connect;
 
-	switch (musb->xceiv->otg->state) {
+	switch (musb_get_state(musb)) {
 	case OTG_STATE_A_HOST:
 	case OTG_STATE_A_WAIT_BCON:
 		pm_runtime_get_sync(musb->controller);
@@ -408,7 +275,7 @@ static ssize_t musb_softconnect_write(struct file *file,
 
 	pm_runtime_get_sync(musb->controller);
 	if (!strncmp(buf, "0", 1)) {
-		switch (musb->xceiv->otg->state) {
+		switch (musb_get_state(musb)) {
 		case OTG_STATE_A_HOST:
 			musb_root_disconnect(musb);
 			reg = musb_readb(musb->mregs, MUSB_DEVCTL);
@@ -419,7 +286,7 @@ static ssize_t musb_softconnect_write(struct file *file,
 			break;
 		}
 	} else if (!strncmp(buf, "1", 1)) {
-		switch (musb->xceiv->otg->state) {
+		switch (musb_get_state(musb)) {
 		case OTG_STATE_A_WAIT_BCON:
 			/*
 			 * musb_save_context() called in musb_runtime_suspend()
@@ -454,48 +321,18 @@ static const struct file_operations musb_softconnect_fops = {
 	.release		= single_release,
 };
 
-int musb_init_debugfs(struct musb *musb)
+void musb_init_debugfs(struct musb *musb)
 {
-	struct dentry		*root;
-	struct dentry		*file;
-	int			ret;
+	struct dentry *root;
 
-	root = debugfs_create_dir(dev_name(musb->controller), NULL);
-	if (!root) {
-		ret = -ENOMEM;
-		goto err0;
-	}
-
-	file = debugfs_create_file("regdump", S_IRUGO, root, musb,
-			&musb_regdump_fops);
-	if (!file) {
-		ret = -ENOMEM;
-		goto err1;
-	}
-
-	file = debugfs_create_file("testmode", S_IRUGO | S_IWUSR,
-			root, musb, &musb_test_mode_fops);
-	if (!file) {
-		ret = -ENOMEM;
-		goto err1;
-	}
-
-	file = debugfs_create_file("softconnect", S_IRUGO | S_IWUSR,
-			root, musb, &musb_softconnect_fops);
-	if (!file) {
-		ret = -ENOMEM;
-		goto err1;
-	}
-
+	root = debugfs_create_dir(dev_name(musb->controller), usb_debug_root);
 	musb->debugfs_root = root;
 
-	return 0;
-
-err1:
-	debugfs_remove_recursive(root);
-
-err0:
-	return ret;
+	debugfs_create_file("regdump", S_IRUGO, root, musb, &musb_regdump_fops);
+	debugfs_create_file("testmode", S_IRUGO | S_IWUSR, root, musb,
+			    &musb_test_mode_fops);
+	debugfs_create_file("softconnect", S_IRUGO | S_IWUSR, root, musb,
+			    &musb_softconnect_fops);
 }
 
 void /* __init_or_exit */ musb_exit_debugfs(struct musb *musb)

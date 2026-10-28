@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * INET		An implementation of the TCP/IP protocol suite for the LINUX
  *		operating system.  INET is implemented using the  BSD Socket
@@ -6,11 +7,6 @@
  *		Definitions for a generic INET TIMEWAIT sock
  *
  *		From code originally in net/tcp.h
- *
- *		This program is free software; you can redistribute it and/or
- *		modify it under the terms of the GNU General Public License
- *		as published by the Free Software Foundation; either version
- *		2 of the License, or (at your option) any later version.
  */
 #ifndef _INET_TIMEWAIT_SOCK_
 #define _INET_TIMEWAIT_SOCK_
@@ -61,21 +57,24 @@ struct inet_timewait_sock {
 #define tw_cookie		__tw_common.skc_cookie
 #define tw_dr			__tw_common.skc_tw_dr
 
-	int			tw_timeout;
-	volatile unsigned char	tw_substate;
+	__u32			tw_mark;
+	unsigned char		tw_substate;
 	unsigned char		tw_rcv_wscale;
 
 	/* Socket demultiplex comparisons on incoming packets. */
 	/* these three are in inet_sock */
 	__be16			tw_sport;
 	/* And these are ours. */
-	unsigned int		tw_kill		: 1,
-				tw_transparent  : 1,
+	unsigned int		tw_transparent  : 1,
 				tw_flowlabel	: 20,
+				tw_usec_ts	: 1,
 				tw_pad		: 2,	/* 2 bits hole */
 				tw_tos		: 8;
+	u32			tw_txhash;
+	u32			tw_priority;
 	struct timer_list	tw_timer;
 	struct inet_bind_bucket	*tw_tb;
+	struct inet_bind2_bucket	*tw_tb2;
 };
 #define tw_tclass tw_tos
 
@@ -94,16 +93,13 @@ struct inet_timewait_sock *inet_twsk_alloc(const struct sock *sk,
 					   struct inet_timewait_death_row *dr,
 					   const int state);
 
-void __inet_twsk_hashdance(struct inet_timewait_sock *tw, struct sock *sk,
-			   struct inet_hashinfo *hashinfo);
+void inet_twsk_hashdance_schedule(struct inet_timewait_sock *tw,
+				  struct sock *sk,
+				  struct inet_hashinfo *hashinfo,
+				  int timeo);
 
 void __inet_twsk_schedule(struct inet_timewait_sock *tw, int timeo,
 			  bool rearm);
-
-static inline void inet_twsk_schedule(struct inet_timewait_sock *tw, int timeo)
-{
-	__inet_twsk_schedule(tw, timeo, false);
-}
 
 static inline void inet_twsk_reschedule(struct inet_timewait_sock *tw, int timeo)
 {
@@ -112,7 +108,7 @@ static inline void inet_twsk_reschedule(struct inet_timewait_sock *tw, int timeo
 
 void inet_twsk_deschedule_put(struct inet_timewait_sock *tw);
 
-void inet_twsk_purge(struct inet_hashinfo *hashinfo, int family);
+void inet_twsk_purge(struct inet_hashinfo *hashinfo);
 
 static inline
 struct net *twsk_net(const struct inet_timewait_sock *twsk)

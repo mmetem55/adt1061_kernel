@@ -1,30 +1,17 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
- *
+ * Copyright (c) 2013-2020, Intel Corporation. All rights reserved.
  * Intel Management Engine Interface (Intel MEI) Linux driver
- * Copyright (c) 2013-2014, Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
  */
 
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/device.h>
-#include <linux/fs.h>
 #include <linux/errno.h>
 #include <linux/types.h>
 #include <linux/pci.h>
 #include <linux/init.h>
 #include <linux/sched.h>
-#include <linux/uuid.h>
-#include <linux/jiffies.h>
 #include <linux/interrupt.h>
 #include <linux/workqueue.h>
 #include <linux/pm_domain.h>
@@ -82,9 +69,9 @@ static int mei_txe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 		goto end;
 	}
 
-	err = pci_set_dma_mask(pdev, DMA_BIT_MASK(36));
+	err = dma_set_mask(&pdev->dev, DMA_BIT_MASK(36));
 	if (err) {
-		err = pci_set_dma_mask(pdev, DMA_BIT_MASK(32));
+		err = dma_set_mask(&pdev->dev, DMA_BIT_MASK(32));
 		if (err) {
 			dev_err(&pdev->dev, "No suitable DMA available.\n");
 			goto end;
@@ -141,7 +128,7 @@ static int mei_txe_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 	 * MEI requires to resume from runtime suspend mode
 	 * in order to perform link reset flow upon system suspend.
 	 */
-	pdev->dev_flags |= PCI_DEV_FLAGS_NEEDS_RESUME;
+	dev_pm_set_driver_flags(&pdev->dev, DPM_FLAG_NO_DIRECT_COMPLETE);
 
 	/*
 	 * TXE maps runtime suspend/resume to own power gating states,
@@ -169,7 +156,7 @@ end:
 }
 
 /**
- * mei_txe_remove - Device Shutdown Routine
+ * mei_txe_shutdown- Device Shutdown Routine
  *
  * @pdev: PCI device structure
  *
@@ -179,11 +166,7 @@ end:
  */
 static void mei_txe_shutdown(struct pci_dev *pdev)
 {
-	struct mei_device *dev;
-
-	dev = pci_get_drvdata(pdev);
-	if (!dev)
-		return;
+	struct mei_device *dev = pci_get_drvdata(pdev);
 
 	dev_dbg(&pdev->dev, "shutdown\n");
 	mei_stop(dev);
@@ -204,13 +187,7 @@ static void mei_txe_shutdown(struct pci_dev *pdev)
  */
 static void mei_txe_remove(struct pci_dev *pdev)
 {
-	struct mei_device *dev;
-
-	dev = pci_get_drvdata(pdev);
-	if (!dev) {
-		dev_err(&pdev->dev, "mei: dev == NULL\n");
-		return;
-	}
+	struct mei_device *dev = pci_get_drvdata(pdev);
 
 	pm_runtime_get_noresume(&pdev->dev);
 
@@ -231,9 +208,6 @@ static int mei_txe_pci_suspend(struct device *device)
 	struct pci_dev *pdev = to_pci_dev(device);
 	struct mei_device *dev = pci_get_drvdata(pdev);
 
-	if (!dev)
-		return -ENODEV;
-
 	dev_dbg(&pdev->dev, "suspend\n");
 
 	mei_stop(dev);
@@ -249,12 +223,8 @@ static int mei_txe_pci_suspend(struct device *device)
 static int mei_txe_pci_resume(struct device *device)
 {
 	struct pci_dev *pdev = to_pci_dev(device);
-	struct mei_device *dev;
+	struct mei_device *dev = pci_get_drvdata(pdev);
 	int err;
-
-	dev = pci_get_drvdata(pdev);
-	if (!dev)
-		return -ENODEV;
 
 	pci_enable_msi(pdev);
 
@@ -286,14 +256,10 @@ static int mei_txe_pci_resume(struct device *device)
 #ifdef CONFIG_PM
 static int mei_txe_pm_runtime_idle(struct device *device)
 {
-	struct pci_dev *pdev = to_pci_dev(device);
-	struct mei_device *dev;
+	struct mei_device *dev = dev_get_drvdata(device);
 
-	dev_dbg(&pdev->dev, "rpm: txe: runtime_idle\n");
+	dev_dbg(device, "rpm: txe: runtime_idle\n");
 
-	dev = pci_get_drvdata(pdev);
-	if (!dev)
-		return -ENODEV;
 	if (mei_write_is_idle(dev))
 		pm_runtime_autosuspend(device);
 
@@ -301,15 +267,10 @@ static int mei_txe_pm_runtime_idle(struct device *device)
 }
 static int mei_txe_pm_runtime_suspend(struct device *device)
 {
-	struct pci_dev *pdev = to_pci_dev(device);
-	struct mei_device *dev;
+	struct mei_device *dev = dev_get_drvdata(device);
 	int ret;
 
-	dev_dbg(&pdev->dev, "rpm: txe: runtime suspend\n");
-
-	dev = pci_get_drvdata(pdev);
-	if (!dev)
-		return -ENODEV;
+	dev_dbg(device, "rpm: txe: runtime suspend\n");
 
 	mutex_lock(&dev->device_lock);
 
@@ -320,7 +281,7 @@ static int mei_txe_pm_runtime_suspend(struct device *device)
 
 	/* keep irq on we are staying in D0 */
 
-	dev_dbg(&pdev->dev, "rpm: txe: runtime suspend ret=%d\n", ret);
+	dev_dbg(device, "rpm: txe: runtime suspend ret=%d\n", ret);
 
 	mutex_unlock(&dev->device_lock);
 
@@ -332,15 +293,10 @@ static int mei_txe_pm_runtime_suspend(struct device *device)
 
 static int mei_txe_pm_runtime_resume(struct device *device)
 {
-	struct pci_dev *pdev = to_pci_dev(device);
-	struct mei_device *dev;
+	struct mei_device *dev = dev_get_drvdata(device);
 	int ret;
 
-	dev_dbg(&pdev->dev, "rpm: txe: runtime resume\n");
-
-	dev = pci_get_drvdata(pdev);
-	if (!dev)
-		return -ENODEV;
+	dev_dbg(device, "rpm: txe: runtime resume\n");
 
 	mutex_lock(&dev->device_lock);
 
@@ -350,7 +306,7 @@ static int mei_txe_pm_runtime_resume(struct device *device)
 
 	mutex_unlock(&dev->device_lock);
 
-	dev_dbg(&pdev->dev, "rpm: txe: runtime resume ret = %d\n", ret);
+	dev_dbg(device, "rpm: txe: runtime resume ret = %d\n", ret);
 
 	if (ret)
 		schedule_work(&dev->reset_work);

@@ -1,9 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright 2006, Johannes Berg <johannes@sipsolutions.net>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
  */
 
 /* just for IFNAMSIZ */
@@ -258,11 +255,10 @@ static unsigned long tpt_trig_traffic(struct ieee80211_local *local,
 	return DIV_ROUND_UP(delta, 1024 / 8);
 }
 
-static void tpt_trig_timer(unsigned long data)
+static void tpt_trig_timer(struct timer_list *t)
 {
-	struct ieee80211_local *local = (void *)data;
-	struct tpt_led_trigger *tpt_trig = local->tpt_led_trigger;
-	struct led_classdev *led_cdev;
+	struct tpt_led_trigger *tpt_trig = from_timer(tpt_trig, t, timer);
+	struct ieee80211_local *local = tpt_trig->local;
 	unsigned long on, off, tpt;
 	int i;
 
@@ -286,10 +282,7 @@ static void tpt_trig_timer(unsigned long data)
 		}
 	}
 
-	read_lock(&local->tpt_led.leddev_list_lock);
-	list_for_each_entry(led_cdev, &local->tpt_led.led_cdevs, trig_list)
-		led_blink_set(led_cdev, &on, &off);
-	read_unlock(&local->tpt_led.leddev_list_lock);
+	led_trigger_blink(&local->tpt_led, on, off);
 }
 
 const char *
@@ -316,8 +309,9 @@ __ieee80211_create_tpt_led_trigger(struct ieee80211_hw *hw,
 	tpt_trig->blink_table = blink_table;
 	tpt_trig->blink_table_len = blink_table_len;
 	tpt_trig->want = flags;
+	tpt_trig->local = local;
 
-	setup_timer(&tpt_trig->timer, tpt_trig_timer, (unsigned long)local);
+	timer_setup(&tpt_trig->timer, tpt_trig_timer, 0);
 
 	local->tpt_led_trigger = tpt_trig;
 
@@ -336,14 +330,13 @@ static void ieee80211_start_tpt_led_trig(struct ieee80211_local *local)
 	tpt_trig_traffic(local, tpt_trig);
 	tpt_trig->running = true;
 
-	tpt_trig_timer((unsigned long)local);
+	tpt_trig_timer(&tpt_trig->timer);
 	mod_timer(&tpt_trig->timer, round_jiffies(jiffies + HZ));
 }
 
 static void ieee80211_stop_tpt_led_trig(struct ieee80211_local *local)
 {
 	struct tpt_led_trigger *tpt_trig = local->tpt_led_trigger;
-	struct led_classdev *led_cdev;
 
 	if (!tpt_trig->running)
 		return;
@@ -351,10 +344,7 @@ static void ieee80211_stop_tpt_led_trig(struct ieee80211_local *local)
 	tpt_trig->running = false;
 	del_timer_sync(&tpt_trig->timer);
 
-	read_lock(&local->tpt_led.leddev_list_lock);
-	list_for_each_entry(led_cdev, &local->tpt_led.led_cdevs, trig_list)
-		led_set_brightness(led_cdev, LED_OFF);
-	read_unlock(&local->tpt_led.leddev_list_lock);
+	led_trigger_event(&local->tpt_led, LED_OFF);
 }
 
 void ieee80211_mod_tpt_led_trig(struct ieee80211_local *local,

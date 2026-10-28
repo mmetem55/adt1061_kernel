@@ -57,8 +57,7 @@
 
 static struct irq_domain *aic_domain;
 
-static asmlinkage void __exception_irq_entry
-aic_handle(struct pt_regs *regs)
+static void __exception_irq_entry aic_handle(struct pt_regs *regs)
 {
 	struct irq_domain_chip_generic *dgc = aic_domain->gc;
 	struct irq_chip_generic *gc = dgc->gc[0];
@@ -71,7 +70,7 @@ aic_handle(struct pt_regs *regs)
 	if (!irqstat)
 		irq_reg_writel(gc, 0, AT91_AIC_EOICR);
 	else
-		handle_domain_irq(aic_domain, irqnr, regs);
+		generic_handle_domain_irq(aic_domain, irqnr);
 }
 
 static int aic_retrigger(struct irq_data *d)
@@ -83,7 +82,7 @@ static int aic_retrigger(struct irq_data *d)
 	irq_reg_writel(gc, d->mask, AT91_AIC_ISCR);
 	irq_gc_unlock(gc);
 
-	return 0;
+	return 1;
 }
 
 static int aic_set_type(struct irq_data *d, unsigned type)

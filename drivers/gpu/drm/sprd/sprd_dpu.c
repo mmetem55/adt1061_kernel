@@ -1,539 +1,574 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
- *Copyright (C) 2018 Spreadtrum Communications Inc.
- *
- *This software is licensed under the terms of the GNU General Public
- *License version 2, as published by the Free Software Foundation, and
- *may be copied, distributed, and modified under those terms.
- *
- *This program is distributed in the hope that it will be useful,
- *but WITHOUT ANY WARRANTY; without even the implied warranty of
- *MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *GNU General Public License for more details.
+ * Copyright (C) 2020 Unisoc Inc.
  */
 
-#include <drm/drm_atomic_helper.h>
-#include <drm/drm_crtc_helper.h>
-#include <drm/drm_plane_helper.h>
-#include <drm/drm_gem_framebuffer_helper.h>
 #include <linux/component.h>
+#include <linux/delay.h>
 #include <linux/dma-buf.h>
+#include <linux/io.h>
+#include <linux/module.h>
 #include <linux/of.h>
-#include <linux/of_address.h>
-#include <linux/of_irq.h>
-#include <linux/pm_runtime.h>
-#include <linux/sprd_iommu.h>
+#include <linux/of_graph.h>
+#include <linux/platform_device.h>
+#include <linux/wait.h>
+#include <linux/workqueue.h>
+
+#include <drm/drm_atomic_helper.h>
+#include <drm/drm_blend.h>
+#include <drm/drm_fb_dma_helper.h>
+#include <drm/drm_framebuffer.h>
+#include <drm/drm_gem_dma_helper.h>
+#include <drm/drm_gem_framebuffer_helper.h>
 
 #include "sprd_drm.h"
 #include "sprd_dpu.h"
-#include "sprd_gem.h"
-#include "sysfs/sysfs_display.h"
+#include "sprd_dsi.h"
+
+/* Global control registers */
+#define REG_DPU_CTRL	0x04
+#define REG_DPU_CFG0	0x08
+#define REG_PANEL_SIZE	0x20
+#define REG_BLEND_SIZE	0x24
+#define REG_BG_COLOR	0x2C
+
+/* Layer0 control registers */
+#define REG_LAY_BASE_ADDR0	0x30
+#define REG_LAY_BASE_ADDR1	0x34
+#define REG_LAY_BASE_ADDR2	0x38
+#define REG_LAY_CTRL		0x40
+#define REG_LAY_SIZE		0x44
+#define REG_LAY_PITCH		0x48
+#define REG_LAY_POS		0x4C
+#define REG_LAY_ALPHA		0x50
+#define REG_LAY_CROP_START	0x5C
+
+/* Interrupt control registers */
+#define REG_DPU_INT_EN		0x1E0
+#define REG_DPU_INT_CLR		0x1E4
+#define REG_DPU_INT_STS		0x1E8
+
+/* DPI control registers */
+#define REG_DPI_CTRL		0x1F0
+#define REG_DPI_H_TIMING	0x1F4
+#define REG_DPI_V_TIMING	0x1F8
+
+/* MMU control registers */
+#define REG_MMU_EN			0x800
+#define REG_MMU_VPN_RANGE		0x80C
+#define REG_MMU_PPN1			0x83C
+#define REG_MMU_RANGE1			0x840
+#define REG_MMU_PPN2			0x844
+#define REG_MMU_RANGE2			0x848
+
+/* Global control bits */
+#define BIT_DPU_RUN			BIT(0)
+#define BIT_DPU_STOP			BIT(1)
+#define BIT_DPU_REG_UPDATE		BIT(2)
+#define BIT_DPU_IF_EDPI			BIT(0)
+
+/* Layer control bits */
+#define BIT_DPU_LAY_EN				BIT(0)
+#define BIT_DPU_LAY_LAYER_ALPHA			(0x01 << 2)
+#define BIT_DPU_LAY_COMBO_ALPHA			(0x02 << 2)
+#define BIT_DPU_LAY_FORMAT_YUV422_2PLANE		(0x00 << 4)
+#define BIT_DPU_LAY_FORMAT_YUV420_2PLANE		(0x01 << 4)
+#define BIT_DPU_LAY_FORMAT_YUV420_3PLANE		(0x02 << 4)
+#define BIT_DPU_LAY_FORMAT_ARGB8888			(0x03 << 4)
+#define BIT_DPU_LAY_FORMAT_RGB565			(0x04 << 4)
+#define BIT_DPU_LAY_DATA_ENDIAN_B0B1B2B3		(0x00 << 8)
+#define BIT_DPU_LAY_DATA_ENDIAN_B3B2B1B0		(0x01 << 8)
+#define BIT_DPU_LAY_NO_SWITCH			(0x00 << 10)
+#define BIT_DPU_LAY_RB_OR_UV_SWITCH		(0x01 << 10)
+#define BIT_DPU_LAY_MODE_BLEND_NORMAL		(0x00 << 16)
+#define BIT_DPU_LAY_MODE_BLEND_PREMULT		(0x01 << 16)
+#define BIT_DPU_LAY_ROTATION_0		(0x00 << 20)
+#define BIT_DPU_LAY_ROTATION_90		(0x01 << 20)
+#define BIT_DPU_LAY_ROTATION_180	(0x02 << 20)
+#define BIT_DPU_LAY_ROTATION_270	(0x03 << 20)
+#define BIT_DPU_LAY_ROTATION_0_M	(0x04 << 20)
+#define BIT_DPU_LAY_ROTATION_90_M	(0x05 << 20)
+#define BIT_DPU_LAY_ROTATION_180_M	(0x06 << 20)
+#define BIT_DPU_LAY_ROTATION_270_M	(0x07 << 20)
+
+/* Interrupt control & status bits */
+#define BIT_DPU_INT_DONE		BIT(0)
+#define BIT_DPU_INT_TE			BIT(1)
+#define BIT_DPU_INT_ERR			BIT(2)
+#define BIT_DPU_INT_UPDATE_DONE		BIT(4)
+#define BIT_DPU_INT_VSYNC		BIT(5)
+
+/* DPI control bits */
+#define BIT_DPU_EDPI_TE_EN		BIT(8)
+#define BIT_DPU_EDPI_FROM_EXTERNAL_PAD	BIT(10)
+#define BIT_DPU_DPI_HALT_EN		BIT(16)
+
+static const u32 layer_fmts[] = {
+	DRM_FORMAT_XRGB8888,
+	DRM_FORMAT_XBGR8888,
+	DRM_FORMAT_ARGB8888,
+	DRM_FORMAT_ABGR8888,
+	DRM_FORMAT_RGBA8888,
+	DRM_FORMAT_BGRA8888,
+	DRM_FORMAT_RGBX8888,
+	DRM_FORMAT_RGB565,
+	DRM_FORMAT_BGR565,
+	DRM_FORMAT_NV12,
+	DRM_FORMAT_NV21,
+	DRM_FORMAT_NV16,
+	DRM_FORMAT_NV61,
+	DRM_FORMAT_YUV420,
+	DRM_FORMAT_YVU420,
+};
 
 struct sprd_plane {
-	struct drm_plane plane;
-	struct drm_property *alpha_property;
-	struct drm_property *blend_mode_property;
-	struct drm_property *fbc_hsize_r_property;
-	struct drm_property *fbc_hsize_y_property;
-	struct drm_property *fbc_hsize_uv_property;
-	struct drm_property *y2r_coef_property;
-	struct drm_property *pallete_en_property;
-	struct drm_property *pallete_color_property;
-	u32 index;
+	struct drm_plane base;
 };
 
-struct sprd_plane_state {
-	struct drm_plane_state state;
-	u8 alpha;
-	u8 blend_mode;
-	u32 fbc_hsize_r;
-	u32 fbc_hsize_y;
-	u32 fbc_hsize_uv;
-	u32 y2r_coef;
-	u32 pallete_en;
-	u32 pallete_color;
-};
-
-LIST_HEAD(dpu_core_head);
-LIST_HEAD(dpu_clk_head);
-LIST_HEAD(dpu_glb_head);
-
-bool calibration_mode;
-static unsigned long frame_count;
-module_param(frame_count, ulong, 0444);
-
-static int sprd_dpu_init(struct sprd_dpu *dpu);
-static int sprd_dpu_uninit(struct sprd_dpu *dpu);
-
-static int boot_mode_check(char *str)
+static int dpu_wait_stop_done(struct sprd_dpu *dpu)
 {
-	if (str != NULL && !strncmp(str, "cali", strlen("cali")))
-		calibration_mode = true;
-	else
-		calibration_mode = false;
-	return 0;
-}
-__setup("androidboot.mode=", boot_mode_check);
+	struct dpu_context *ctx = &dpu->ctx;
+	int rc;
 
-static inline struct sprd_plane *to_sprd_plane(struct drm_plane *plane)
-{
-	return container_of(plane, struct sprd_plane, plane);
-}
+	if (ctx->stopped)
+		return 0;
 
-static inline struct
-sprd_plane_state *to_sprd_plane_state(const struct drm_plane_state *state)
-{
-	return container_of(state, struct sprd_plane_state, state);
-}
+	rc = wait_event_interruptible_timeout(ctx->wait_queue, ctx->evt_stop,
+					      msecs_to_jiffies(500));
+	ctx->evt_stop = false;
 
-static int sprd_dpu_iommu_map(struct device *dev,
-				struct sprd_gem_obj *sprd_gem)
-{
-	struct dma_buf *dma_buf;
-	struct sprd_iommu_map_data iommu_data = {};
+	ctx->stopped = true;
 
-	dma_buf = sprd_gem->base.import_attach->dmabuf;
-	iommu_data.buf = dma_buf->priv;
-	iommu_data.iova_size = dma_buf->size;
-	iommu_data.ch_type = SPRD_IOMMU_FM_CH_RW;
-
-	if (sprd_iommu_map(dev, &iommu_data)) {
-		DRM_ERROR("failed to map iommu address\n");
-		return -EINVAL;
+	if (!rc) {
+		drm_err(dpu->drm, "dpu wait for stop done time out!\n");
+		return -ETIMEDOUT;
 	}
 
-	sprd_gem->dma_addr = iommu_data.iova_addr;
+	return 0;
+}
+
+static int dpu_wait_update_done(struct sprd_dpu *dpu)
+{
+	struct dpu_context *ctx = &dpu->ctx;
+	int rc;
+
+	ctx->evt_update = false;
+
+	rc = wait_event_interruptible_timeout(ctx->wait_queue, ctx->evt_update,
+					      msecs_to_jiffies(500));
+
+	if (!rc) {
+		drm_err(dpu->drm, "dpu wait for reg update done time out!\n");
+		return -ETIMEDOUT;
+	}
 
 	return 0;
 }
 
-static void sprd_dpu_iommu_unmap(struct device *dev,
-				struct sprd_gem_obj *sprd_gem)
+static u32 drm_format_to_dpu(struct drm_framebuffer *fb)
 {
-	struct sprd_iommu_unmap_data iommu_data = {};
+	u32 format = 0;
 
-	iommu_data.iova_size = sprd_gem->base.size;
-	iommu_data.iova_addr = sprd_gem->dma_addr;
-	iommu_data.ch_type = SPRD_IOMMU_FM_CH_RW;
+	switch (fb->format->format) {
+	case DRM_FORMAT_BGRA8888:
+		/* BGRA8888 -> ARGB8888 */
+		format |= BIT_DPU_LAY_DATA_ENDIAN_B3B2B1B0;
+		format |= BIT_DPU_LAY_FORMAT_ARGB8888;
+		break;
+	case DRM_FORMAT_RGBX8888:
+	case DRM_FORMAT_RGBA8888:
+		/* RGBA8888 -> ABGR8888 */
+		format |= BIT_DPU_LAY_DATA_ENDIAN_B3B2B1B0;
+		fallthrough;
+	case DRM_FORMAT_ABGR8888:
+		/* RB switch */
+		format |= BIT_DPU_LAY_RB_OR_UV_SWITCH;
+		fallthrough;
+	case DRM_FORMAT_ARGB8888:
+		format |= BIT_DPU_LAY_FORMAT_ARGB8888;
+		break;
+	case DRM_FORMAT_XBGR8888:
+		/* RB switch */
+		format |= BIT_DPU_LAY_RB_OR_UV_SWITCH;
+		fallthrough;
+	case DRM_FORMAT_XRGB8888:
+		format |= BIT_DPU_LAY_FORMAT_ARGB8888;
+		break;
+	case DRM_FORMAT_BGR565:
+		/* RB switch */
+		format |= BIT_DPU_LAY_RB_OR_UV_SWITCH;
+		fallthrough;
+	case DRM_FORMAT_RGB565:
+		format |= BIT_DPU_LAY_FORMAT_RGB565;
+		break;
+	case DRM_FORMAT_NV12:
+		/* 2-Lane: Yuv420 */
+		format |= BIT_DPU_LAY_FORMAT_YUV420_2PLANE;
+		/* Y endian */
+		format |= BIT_DPU_LAY_DATA_ENDIAN_B0B1B2B3;
+		/* UV endian */
+		format |= BIT_DPU_LAY_NO_SWITCH;
+		break;
+	case DRM_FORMAT_NV21:
+		/* 2-Lane: Yuv420 */
+		format |= BIT_DPU_LAY_FORMAT_YUV420_2PLANE;
+		/* Y endian */
+		format |= BIT_DPU_LAY_DATA_ENDIAN_B0B1B2B3;
+		/* UV endian */
+		format |= BIT_DPU_LAY_RB_OR_UV_SWITCH;
+		break;
+	case DRM_FORMAT_NV16:
+		/* 2-Lane: Yuv422 */
+		format |= BIT_DPU_LAY_FORMAT_YUV422_2PLANE;
+		/* Y endian */
+		format |= BIT_DPU_LAY_DATA_ENDIAN_B3B2B1B0;
+		/* UV endian */
+		format |= BIT_DPU_LAY_RB_OR_UV_SWITCH;
+		break;
+	case DRM_FORMAT_NV61:
+		/* 2-Lane: Yuv422 */
+		format |= BIT_DPU_LAY_FORMAT_YUV422_2PLANE;
+		/* Y endian */
+		format |= BIT_DPU_LAY_DATA_ENDIAN_B0B1B2B3;
+		/* UV endian */
+		format |= BIT_DPU_LAY_NO_SWITCH;
+		break;
+	case DRM_FORMAT_YUV420:
+		format |= BIT_DPU_LAY_FORMAT_YUV420_3PLANE;
+		/* Y endian */
+		format |= BIT_DPU_LAY_DATA_ENDIAN_B0B1B2B3;
+		/* UV endian */
+		format |= BIT_DPU_LAY_NO_SWITCH;
+		break;
+	case DRM_FORMAT_YVU420:
+		format |= BIT_DPU_LAY_FORMAT_YUV420_3PLANE;
+		/* Y endian */
+		format |= BIT_DPU_LAY_DATA_ENDIAN_B0B1B2B3;
+		/* UV endian */
+		format |= BIT_DPU_LAY_RB_OR_UV_SWITCH;
+		break;
+	default:
+		break;
+	}
 
-	if (sprd_iommu_unmap(dev, &iommu_data))
-		DRM_ERROR("failed to unmap iommu address\n");
+	return format;
 }
 
-static int of_get_logo_memory_info(struct sprd_dpu *dpu,
-	struct device_node *np)
+static u32 drm_rotation_to_dpu(struct drm_plane_state *state)
 {
-	struct device_node *node;
-	struct resource r;
-	int ret;
+	u32 rotation = 0;
+
+	switch (state->rotation) {
+	default:
+	case DRM_MODE_ROTATE_0:
+		rotation = BIT_DPU_LAY_ROTATION_0;
+		break;
+	case DRM_MODE_ROTATE_90:
+		rotation = BIT_DPU_LAY_ROTATION_90;
+		break;
+	case DRM_MODE_ROTATE_180:
+		rotation = BIT_DPU_LAY_ROTATION_180;
+		break;
+	case DRM_MODE_ROTATE_270:
+		rotation = BIT_DPU_LAY_ROTATION_270;
+		break;
+	case DRM_MODE_REFLECT_Y:
+		rotation = BIT_DPU_LAY_ROTATION_180_M;
+		break;
+	case (DRM_MODE_REFLECT_Y | DRM_MODE_ROTATE_90):
+		rotation = BIT_DPU_LAY_ROTATION_90_M;
+		break;
+	case DRM_MODE_REFLECT_X:
+		rotation = BIT_DPU_LAY_ROTATION_0_M;
+		break;
+	case (DRM_MODE_REFLECT_X | DRM_MODE_ROTATE_90):
+		rotation = BIT_DPU_LAY_ROTATION_270_M;
+		break;
+	}
+
+	return rotation;
+}
+
+static u32 drm_blend_to_dpu(struct drm_plane_state *state)
+{
+	u32 blend = 0;
+
+	switch (state->pixel_blend_mode) {
+	case DRM_MODE_BLEND_COVERAGE:
+		/* alpha mode select - combo alpha */
+		blend |= BIT_DPU_LAY_COMBO_ALPHA;
+		/* Normal mode */
+		blend |= BIT_DPU_LAY_MODE_BLEND_NORMAL;
+		break;
+	case DRM_MODE_BLEND_PREMULTI:
+		/* alpha mode select - combo alpha */
+		blend |= BIT_DPU_LAY_COMBO_ALPHA;
+		/* Pre-mult mode */
+		blend |= BIT_DPU_LAY_MODE_BLEND_PREMULT;
+		break;
+	case DRM_MODE_BLEND_PIXEL_NONE:
+	default:
+		/* don't do blending, maybe RGBX */
+		/* alpha mode select - layer alpha */
+		blend |= BIT_DPU_LAY_LAYER_ALPHA;
+		break;
+	}
+
+	return blend;
+}
+
+static void sprd_dpu_layer(struct sprd_dpu *dpu, struct drm_plane_state *state)
+{
+	struct dpu_context *ctx = &dpu->ctx;
+	struct drm_gem_dma_object *dma_obj;
+	struct drm_framebuffer *fb = state->fb;
+	u32 addr, size, offset, pitch, blend, format, rotation;
+	u32 src_x = state->src_x >> 16;
+	u32 src_y = state->src_y >> 16;
+	u32 src_w = state->src_w >> 16;
+	u32 src_h = state->src_h >> 16;
+	u32 dst_x = state->crtc_x;
+	u32 dst_y = state->crtc_y;
+	u32 alpha = state->alpha;
+	u32 index = state->zpos;
+	int i;
+
+	offset = (dst_x & 0xffff) | (dst_y << 16);
+	size = (src_w & 0xffff) | (src_h << 16);
+
+	for (i = 0; i < fb->format->num_planes; i++) {
+		dma_obj = drm_fb_dma_get_gem_obj(fb, i);
+		addr = dma_obj->dma_addr + fb->offsets[i];
+
+		if (i == 0)
+			layer_reg_wr(ctx, REG_LAY_BASE_ADDR0, addr, index);
+		else if (i == 1)
+			layer_reg_wr(ctx, REG_LAY_BASE_ADDR1, addr, index);
+		else
+			layer_reg_wr(ctx, REG_LAY_BASE_ADDR2, addr, index);
+	}
+
+	if (fb->format->num_planes == 3) {
+		/* UV pitch is 1/2 of Y pitch */
+		pitch = (fb->pitches[0] / fb->format->cpp[0]) |
+				(fb->pitches[0] / fb->format->cpp[0] << 15);
+	} else {
+		pitch = fb->pitches[0] / fb->format->cpp[0];
+	}
+
+	layer_reg_wr(ctx, REG_LAY_POS, offset, index);
+	layer_reg_wr(ctx, REG_LAY_SIZE, size, index);
+	layer_reg_wr(ctx, REG_LAY_CROP_START,
+		     src_y << 16 | src_x, index);
+	layer_reg_wr(ctx, REG_LAY_ALPHA, alpha, index);
+	layer_reg_wr(ctx, REG_LAY_PITCH, pitch, index);
+
+	format = drm_format_to_dpu(fb);
+	blend = drm_blend_to_dpu(state);
+	rotation = drm_rotation_to_dpu(state);
+
+	layer_reg_wr(ctx, REG_LAY_CTRL, BIT_DPU_LAY_EN |
+				format |
+				blend |
+				rotation,
+				index);
+}
+
+static void sprd_dpu_flip(struct sprd_dpu *dpu)
+{
 	struct dpu_context *ctx = &dpu->ctx;
 
-	node = of_parse_phandle(np, "sprd,logo-memory", 0);
-	if (!node) {
-		DRM_INFO("no sprd,logo-memory specified\n");
-		return 0;
+	/*
+	 * Make sure the dpu is in stop status. DPU has no shadow
+	 * registers in EDPI mode. So the config registers can only be
+	 * updated in the rising edge of DPU_RUN bit.
+	 */
+	if (ctx->if_type == SPRD_DPU_IF_EDPI)
+		dpu_wait_stop_done(dpu);
+
+	/* update trigger and wait */
+	if (ctx->if_type == SPRD_DPU_IF_DPI) {
+		if (!ctx->stopped) {
+			dpu_reg_set(ctx, REG_DPU_CTRL, BIT_DPU_REG_UPDATE);
+			dpu_wait_update_done(dpu);
+		}
+
+		dpu_reg_set(ctx, REG_DPU_INT_EN, BIT_DPU_INT_ERR);
+	} else if (ctx->if_type == SPRD_DPU_IF_EDPI) {
+		dpu_reg_set(ctx, REG_DPU_CTRL, BIT_DPU_RUN);
+
+		ctx->stopped = false;
 	}
-
-	ret = of_address_to_resource(node, 0, &r);
-	of_node_put(node);
-	if (ret) {
-		DRM_ERROR("invalid logo reserved memory node!\n");
-		return -EINVAL;
-	}
-
-	ctx->logo_addr = r.start;
-	ctx->logo_size = resource_size(&r);
-
-	return 0;
 }
 
-static int sprd_plane_prepare_fb(struct drm_plane *plane,
-				struct drm_plane_state *new_state)
+static void sprd_dpu_init(struct sprd_dpu *dpu)
 {
-	struct drm_plane_state *curr_state = plane->state;
-	struct drm_framebuffer *fb;
-	struct drm_gem_object *obj;
-	struct sprd_gem_obj *sprd_gem;
-	struct sprd_dpu *dpu;
-	int i;
+	struct dpu_context *ctx = &dpu->ctx;
+	u32 int_mask = 0;
 
-	if ((curr_state->fb == new_state->fb) || !new_state->fb)
-		return 0;
+	writel(0x00, ctx->base + REG_BG_COLOR);
+	writel(0x00, ctx->base + REG_MMU_EN);
+	writel(0x00, ctx->base + REG_MMU_PPN1);
+	writel(0xffff, ctx->base + REG_MMU_RANGE1);
+	writel(0x00, ctx->base + REG_MMU_PPN2);
+	writel(0xffff, ctx->base + REG_MMU_RANGE2);
+	writel(0x1ffff, ctx->base + REG_MMU_VPN_RANGE);
 
-	fb = new_state->fb;
-	dpu = crtc_to_dpu(new_state->crtc);
+	if (ctx->if_type == SPRD_DPU_IF_DPI) {
+		/* use dpi as interface */
+		dpu_reg_clr(ctx, REG_DPU_CFG0, BIT_DPU_IF_EDPI);
+		/* disable Halt function for SPRD DSI */
+		dpu_reg_clr(ctx, REG_DPI_CTRL, BIT_DPU_DPI_HALT_EN);
+		/* select te from external pad */
+		dpu_reg_set(ctx, REG_DPI_CTRL, BIT_DPU_EDPI_FROM_EXTERNAL_PAD);
 
-	if (!dpu->ctx.is_inited) {
-		DRM_WARN("dpu has already powered off\n");
-		return 0;
+		/* enable dpu update done INT */
+		int_mask |= BIT_DPU_INT_UPDATE_DONE;
+		/* enable dpu done INT */
+		int_mask |= BIT_DPU_INT_DONE;
+		/* enable dpu dpi vsync */
+		int_mask |= BIT_DPU_INT_VSYNC;
+		/* enable dpu TE INT */
+		int_mask |= BIT_DPU_INT_TE;
+		/* enable underflow err INT */
+		int_mask |= BIT_DPU_INT_ERR;
+	} else if (ctx->if_type == SPRD_DPU_IF_EDPI) {
+		/* use edpi as interface */
+		dpu_reg_set(ctx, REG_DPU_CFG0, BIT_DPU_IF_EDPI);
+		/* use external te */
+		dpu_reg_set(ctx, REG_DPI_CTRL, BIT_DPU_EDPI_FROM_EXTERNAL_PAD);
+		/* enable te */
+		dpu_reg_set(ctx, REG_DPI_CTRL, BIT_DPU_EDPI_TE_EN);
+
+		/* enable stop done INT */
+		int_mask |= BIT_DPU_INT_DONE;
+		/* enable TE INT */
+		int_mask |= BIT_DPU_INT_TE;
 	}
 
-	for (i = 0; i < fb->format->num_planes; i++) {
-		obj = drm_gem_fb_get_obj(fb, i);
-		sprd_gem = to_sprd_gem_obj(obj);
-		if (sprd_gem->need_iommu)
-			sprd_dpu_iommu_map(&dpu->dev, sprd_gem);
-	}
-
-	return 0;
+	writel(int_mask, ctx->base + REG_DPU_INT_EN);
 }
 
-static void sprd_plane_cleanup_fb(struct drm_plane *plane,
-				struct drm_plane_state *old_state)
+static void sprd_dpu_fini(struct sprd_dpu *dpu)
 {
-	struct drm_plane_state *curr_state = plane->state;
-	struct drm_framebuffer *fb;
-	struct drm_gem_object *obj;
-	struct sprd_gem_obj *sprd_gem;
-	struct sprd_dpu *dpu;
-	int i;
-	static atomic_t logo2animation = { -1 };
+	struct dpu_context *ctx = &dpu->ctx;
 
-	if ((curr_state->fb == old_state->fb) || !old_state->fb)
-		return;
+	writel(0x00, ctx->base + REG_DPU_INT_EN);
+	writel(0xff, ctx->base + REG_DPU_INT_CLR);
+}
 
-	fb = old_state->fb;
-	dpu = crtc_to_dpu(old_state->crtc);
+static void sprd_dpi_init(struct sprd_dpu *dpu)
+{
+	struct dpu_context *ctx = &dpu->ctx;
+	u32 reg_val;
+	u32 size;
 
-	if (!dpu->ctx.is_inited) {
-		DRM_WARN("dpu has already powered off\n");
-		return;
+	size = (ctx->vm.vactive << 16) | ctx->vm.hactive;
+	writel(size, ctx->base + REG_PANEL_SIZE);
+	writel(size, ctx->base + REG_BLEND_SIZE);
+
+	if (ctx->if_type == SPRD_DPU_IF_DPI) {
+		/* set dpi timing */
+		reg_val = ctx->vm.hsync_len << 0 |
+			  ctx->vm.hback_porch << 8 |
+			  ctx->vm.hfront_porch << 20;
+		writel(reg_val, ctx->base + REG_DPI_H_TIMING);
+
+		reg_val = ctx->vm.vsync_len << 0 |
+			  ctx->vm.vback_porch << 8 |
+			  ctx->vm.vfront_porch << 20;
+		writel(reg_val, ctx->base + REG_DPI_V_TIMING);
 	}
+}
 
-	for (i = 0; i < fb->format->num_planes; i++) {
-		obj = drm_gem_fb_get_obj(fb, i);
-		sprd_gem = to_sprd_gem_obj(obj);
-		if (sprd_gem->need_iommu)
-			sprd_dpu_iommu_unmap(&dpu->dev, sprd_gem);
-	}
+void sprd_dpu_run(struct sprd_dpu *dpu)
+{
+	struct dpu_context *ctx = &dpu->ctx;
 
-	if (unlikely(atomic_inc_not_zero(&logo2animation)) &&
-		dpu->ctx.logo_addr) {
-		DRM_INFO("free logo memory addr:0x%lx size:0x%lx\n",
-			dpu->ctx.logo_addr, dpu->ctx.logo_size);
-		free_reserved_area(phys_to_virt(dpu->ctx.logo_addr),
-			phys_to_virt(dpu->ctx.logo_addr + dpu->ctx.logo_size),
-			-1, "logo");
-	}
+	dpu_reg_set(ctx, REG_DPU_CTRL, BIT_DPU_RUN);
+
+	ctx->stopped = false;
+}
+
+void sprd_dpu_stop(struct sprd_dpu *dpu)
+{
+	struct dpu_context *ctx = &dpu->ctx;
+
+	if (ctx->if_type == SPRD_DPU_IF_DPI)
+		dpu_reg_set(ctx, REG_DPU_CTRL, BIT_DPU_STOP);
+
+	dpu_wait_stop_done(dpu);
 }
 
 static int sprd_plane_atomic_check(struct drm_plane *plane,
-				  struct drm_plane_state *state)
+				   struct drm_atomic_state *state)
 {
-	DRM_DEBUG("%s()\n", __func__);
+	struct drm_plane_state *plane_state = drm_atomic_get_new_plane_state(state,
+									     plane);
+	struct drm_crtc_state *crtc_state;
+	u32 fmt;
 
-	return 0;
-}
+	if (!plane_state->fb || !plane_state->crtc)
+		return 0;
 
-static void sprd_plane_atomic_update(struct drm_plane *plane,
-				    struct drm_plane_state *old_state)
-{
-	struct drm_plane_state *state = plane->state;
-	struct drm_framebuffer *fb = plane->state->fb;
-	struct drm_gem_object *obj;
-	struct sprd_gem_obj *sprd_gem;
-	struct sprd_plane *p = to_sprd_plane(plane);
-	struct sprd_plane_state *s = to_sprd_plane_state(state);
-	struct sprd_dpu *dpu = crtc_to_dpu(plane->state->crtc);
-	struct sprd_dpu_layer *layer = &dpu->layers[p->index];
-	int i;
-
-	if (plane->state->crtc->state->active_changed) {
-		DRM_DEBUG("resume or suspend, no need to update plane\n");
-		return;
-	}
-
-	if (s->pallete_en) {
-		layer->index = p->index;
-		layer->dst_x = state->crtc_x;
-		layer->dst_y = state->crtc_y;
-		layer->dst_w = state->crtc_w;
-		layer->dst_h = state->crtc_h;
-		layer->alpha = s->alpha;
-		layer->blending = s->blend_mode;
-		layer->pallete_en = s->pallete_en;
-		layer->pallete_color = s->pallete_color;
-		dpu->pending_planes++;
-		DRM_DEBUG("%s() pallete_color = %u, index = %u\n",
-			__func__, layer->pallete_color, layer->index);
-		return;
-	}
-
-	layer->index = p->index;
-	layer->src_x = state->src_x >> 16;
-	layer->src_y = state->src_y >> 16;
-	layer->src_w = state->src_w >> 16;
-	layer->src_h = state->src_h >> 16;
-	layer->dst_x = state->crtc_x;
-	layer->dst_y = state->crtc_y;
-	layer->dst_w = state->crtc_w;
-	layer->dst_h = state->crtc_h;
-	layer->rotation = state->rotation;
-	layer->planes = fb->format->num_planes;
-	layer->format = fb->format->format;
-	layer->alpha = s->alpha;
-	layer->blending = s->blend_mode;
-	layer->xfbc = fb->modifier;
-	layer->header_size_r = s->fbc_hsize_r;
-	layer->header_size_y = s->fbc_hsize_y;
-	layer->header_size_uv = s->fbc_hsize_uv;
-	layer->y2r_coef = s->y2r_coef;
-	layer->pallete_en = s->pallete_en;
-	layer->pallete_color = s->pallete_color;
-
-	DRM_DEBUG("%s() alpha = %u, blending = %u, rotation = %u, y2r_coef = %u\n",
-		  __func__, layer->alpha, layer->blending, layer->rotation, s->y2r_coef);
-
-	DRM_DEBUG("%s() xfbc = %u, hsize_r = %u, hsize_y = %u, hsize_uv = %u\n",
-		  __func__, layer->xfbc, layer->header_size_r,
-		  layer->header_size_y, layer->header_size_uv);
-
-	for (i = 0; i < layer->planes; i++) {
-		obj = drm_gem_fb_get_obj(fb, i);
-		sprd_gem = to_sprd_gem_obj(obj);
-		layer->addr[i] = sprd_gem->dma_addr + fb->offsets[i];
-		layer->pitch[i] = fb->pitches[i];
-	}
-
-	dpu->pending_planes++;
-}
-
-static void sprd_plane_atomic_disable(struct drm_plane *plane,
-				     struct drm_plane_state *old_state)
-{
-	struct sprd_plane *p = to_sprd_plane(plane);
-
-	/*
-	 * NOTE:
-	 * The dpu->core->flip() will disable all the planes each time.
-	 * So there is no need to impliment the atomic_disable() function.
-	 * But this function can not be removed, because it will change
-	 * to call atomic_update() callback instead. Which will cause
-	 * kernel panic in sprd_plane_atomic_update().
-	 *
-	 * We do nothing here but just print a debug log.
-	 */
-	DRM_DEBUG("%s() layer_id = %u\n", __func__, p->index);
-}
-
-static void sprd_plane_reset(struct drm_plane *plane)
-{
-	struct sprd_plane *p = to_sprd_plane(plane);
-	struct sprd_plane_state *s;
-
-	DRM_INFO("%s()\n", __func__);
-
-	if (plane->state) {
-		__drm_atomic_helper_plane_destroy_state(plane->state);
-
-		s = to_sprd_plane_state(plane->state);
-		memset(s, 0, sizeof(*s));
-	} else {
-		s = kzalloc(sizeof(*s), GFP_KERNEL);
-		if (!s)
-			return;
-		plane->state = &s->state;
-	}
-
-	s->state.plane = plane;
-	s->state.zpos = p->index;
-	s->alpha = 255;
-	s->blend_mode = DRM_MODE_BLEND_PIXEL_NONE;
-}
-
-static struct drm_plane_state *
-sprd_plane_atomic_duplicate_state(struct drm_plane *plane)
-{
-	struct sprd_plane_state *s;
-	struct sprd_plane_state *old_state = to_sprd_plane_state(plane->state);
-
-	DRM_DEBUG("%s()\n", __func__);
-
-	s = kzalloc(sizeof(*s), GFP_KERNEL);
-	if (!s)
-		return NULL;
-
-	__drm_atomic_helper_plane_duplicate_state(plane, &s->state);
-
-	WARN_ON(s->state.plane != plane);
-
-	s->alpha = old_state->alpha;
-	s->blend_mode = old_state->blend_mode;
-	s->fbc_hsize_r = old_state->fbc_hsize_r;
-	s->fbc_hsize_y = old_state->fbc_hsize_y;
-	s->fbc_hsize_uv = old_state->fbc_hsize_uv;
-	s->y2r_coef = old_state->y2r_coef;
-	s->pallete_en = old_state->pallete_en;
-	s->pallete_color = old_state->pallete_color;
-
-	return &s->state;
-}
-
-static void sprd_plane_atomic_destroy_state(struct drm_plane *plane,
-					    struct drm_plane_state *state)
-{
-	DRM_DEBUG("%s()\n", __func__);
-
-	__drm_atomic_helper_plane_destroy_state(state);
-	kfree(to_sprd_plane_state(state));
-}
-
-static int sprd_plane_atomic_set_property(struct drm_plane *plane,
-					  struct drm_plane_state *state,
-					  struct drm_property *property,
-					  u64 val)
-{
-	struct sprd_plane *p = to_sprd_plane(plane);
-	struct sprd_plane_state *s = to_sprd_plane_state(state);
-
-	DRM_DEBUG("%s() name = %s, val = %llu\n",
-		  __func__, property->name, val);
-
-	if (property == p->alpha_property)
-		s->alpha = val;
-	else if (property == p->blend_mode_property)
-		s->blend_mode = val;
-	else if (property == p->fbc_hsize_r_property)
-		s->fbc_hsize_r = val;
-	else if (property == p->fbc_hsize_y_property)
-		s->fbc_hsize_y = val;
-	else if (property == p->fbc_hsize_uv_property)
-		s->fbc_hsize_uv = val;
-	else if (property == p->y2r_coef_property)
-		s->y2r_coef = val;
-	else if (property == p->pallete_en_property)
-		s->pallete_en = val;
-	else if (property == p->pallete_color_property)
-		s->pallete_color = val;
-	else {
-		DRM_ERROR("property %s is invalid\n", property->name);
+	fmt = drm_format_to_dpu(plane_state->fb);
+	if (!fmt)
 		return -EINVAL;
-	}
 
-	return 0;
+	crtc_state = drm_atomic_get_crtc_state(plane_state->state, plane_state->crtc);
+	if (IS_ERR(crtc_state))
+		return PTR_ERR(crtc_state);
+
+	return drm_atomic_helper_check_plane_state(plane_state, crtc_state,
+						  DRM_PLANE_NO_SCALING,
+						  DRM_PLANE_NO_SCALING,
+						  true, true);
 }
 
-static int sprd_plane_atomic_get_property(struct drm_plane *plane,
-					  const struct drm_plane_state *state,
-					  struct drm_property *property,
-					  u64 *val)
+static void sprd_plane_atomic_update(struct drm_plane *drm_plane,
+				     struct drm_atomic_state *state)
 {
-	struct sprd_plane *p = to_sprd_plane(plane);
-	const struct sprd_plane_state *s = to_sprd_plane_state(state);
+	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state,
+									   drm_plane);
+	struct sprd_dpu *dpu = to_sprd_crtc(new_state->crtc);
 
-	DRM_DEBUG("%s() name = %s\n", __func__, property->name);
-
-	if (property == p->alpha_property)
-		*val = s->alpha;
-	else if (property == p->blend_mode_property)
-		*val = s->blend_mode;
-	else if (property == p->fbc_hsize_r_property)
-		*val = s->fbc_hsize_r;
-	else if (property == p->fbc_hsize_y_property)
-		*val = s->fbc_hsize_y;
-	else if (property == p->fbc_hsize_uv_property)
-		*val = s->fbc_hsize_uv;
-	else if (property == p->y2r_coef_property)
-		*val = s->y2r_coef;
-	else if (property == p->pallete_en_property)
-		*val = s->pallete_en;
-	else if (property == p->pallete_color_property)
-		*val = s->pallete_color;
-	else {
-		DRM_ERROR("property %s is invalid\n", property->name);
-		return -EINVAL;
-	}
-
-	return 0;
+	/* start configure dpu layers */
+	sprd_dpu_layer(dpu, new_state);
 }
 
-static int sprd_plane_create_properties(struct sprd_plane *p, int index)
+static void sprd_plane_atomic_disable(struct drm_plane *drm_plane,
+				      struct drm_atomic_state *state)
 {
-	struct drm_property *prop;
-	static const struct drm_prop_enum_list blend_mode_enum_list[] = {
-		{ DRM_MODE_BLEND_PIXEL_NONE, "None" },
-		{ DRM_MODE_BLEND_PREMULTI, "Pre-multiplied" },
-		{ DRM_MODE_BLEND_COVERAGE, "Coverage" },
-	};
+	struct drm_plane_state *old_state = drm_atomic_get_old_plane_state(state,
+									   drm_plane);
+	struct sprd_dpu *dpu = to_sprd_crtc(old_state->crtc);
+
+	layer_reg_wr(&dpu->ctx, REG_LAY_CTRL, 0x00, old_state->zpos);
+}
+
+static void sprd_plane_create_properties(struct sprd_plane *plane, int index)
+{
+	unsigned int supported_modes = BIT(DRM_MODE_BLEND_PIXEL_NONE) |
+				       BIT(DRM_MODE_BLEND_PREMULTI) |
+				       BIT(DRM_MODE_BLEND_COVERAGE);
 
 	/* create rotation property */
-	drm_plane_create_rotation_property(&p->plane,
+	drm_plane_create_rotation_property(&plane->base,
 					   DRM_MODE_ROTATE_0,
 					   DRM_MODE_ROTATE_MASK |
 					   DRM_MODE_REFLECT_MASK);
 
-	/* create zpos property */
-	drm_plane_create_zpos_immutable_property(&p->plane, index);
-
-	/* create layer alpha property */
-	prop = drm_property_create_range(p->plane.dev, 0, "alpha", 0, 255);
-	if (!prop)
-		return -ENOMEM;
-	drm_object_attach_property(&p->plane.base, prop, 255);
-	p->alpha_property = prop;
+	/* create alpha property */
+	drm_plane_create_alpha_property(&plane->base);
 
 	/* create blend mode property */
-	prop = drm_property_create_enum(p->plane.dev, DRM_MODE_PROP_ENUM,
-					"pixel blend mode",
-					blend_mode_enum_list,
-					ARRAY_SIZE(blend_mode_enum_list));
-	if (!prop)
-		return -ENOMEM;
-	drm_object_attach_property(&p->plane.base, prop,
-				   DRM_MODE_BLEND_PIXEL_NONE);
-	p->blend_mode_property = prop;
+	drm_plane_create_blend_mode_property(&plane->base, supported_modes);
 
-	/* create fbc header size property */
-	prop = drm_property_create_range(p->plane.dev, 0,
-			"FBC header size RGB", 0, UINT_MAX);
-	if (!prop)
-		return -ENOMEM;
-	drm_object_attach_property(&p->plane.base, prop, 0);
-	p->fbc_hsize_r_property = prop;
-
-	prop = drm_property_create_range(p->plane.dev, 0,
-			"FBC header size Y", 0, UINT_MAX);
-	if (!prop)
-		return -ENOMEM;
-	drm_object_attach_property(&p->plane.base, prop, 0);
-	p->fbc_hsize_y_property = prop;
-
-	prop = drm_property_create_range(p->plane.dev, 0,
-			"FBC header size UV", 0, UINT_MAX);
-	if (!prop)
-		return -ENOMEM;
-	drm_object_attach_property(&p->plane.base, prop, 0);
-	p->fbc_hsize_uv_property = prop;
-
-	/* create y2r coef property */
-	prop = drm_property_create_range(p->plane.dev, 0,
-			"YUV2RGB coef", 0, UINT_MAX);
-	if (!prop)
-		return -ENOMEM;
-	drm_object_attach_property(&p->plane.base, prop, 0);
-	p->y2r_coef_property = prop;
-
-	/* create pallete enable property */
-	prop = drm_property_create_range(p->plane.dev, 0,
-			"pallete enable", 0, UINT_MAX);
-	if (!prop)
-		return -ENOMEM;
-	drm_object_attach_property(&p->plane.base, prop, 0);
-	p->pallete_en_property = prop;
-
-	/* create pallete color property */
-	prop = drm_property_create_range(p->plane.dev, 0,
-			"pallete color", 0, UINT_MAX);
-	if (!prop)
-		return -ENOMEM;
-	drm_object_attach_property(&p->plane.base, prop, 0);
-	p->pallete_color_property = prop;
-
-	return 0;
+	/* create zpos property */
+	drm_plane_create_zpos_immutable_property(&plane->base, index);
 }
 
 static const struct drm_plane_helper_funcs sprd_plane_helper_funcs = {
-	.prepare_fb = sprd_plane_prepare_fb,
-	.cleanup_fb = sprd_plane_cleanup_fb,
 	.atomic_check = sprd_plane_atomic_check,
 	.atomic_update = sprd_plane_atomic_update,
 	.atomic_disable = sprd_plane_atomic_disable,
@@ -543,185 +578,82 @@ static const struct drm_plane_funcs sprd_plane_funcs = {
 	.update_plane = drm_atomic_helper_update_plane,
 	.disable_plane	= drm_atomic_helper_disable_plane,
 	.destroy = drm_plane_cleanup,
-	.reset = sprd_plane_reset,
-	.atomic_duplicate_state = sprd_plane_atomic_duplicate_state,
-	.atomic_destroy_state = sprd_plane_atomic_destroy_state,
-	.atomic_set_property = sprd_plane_atomic_set_property,
-	.atomic_get_property = sprd_plane_atomic_get_property,
+	.reset = drm_atomic_helper_plane_reset,
+	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
+	.atomic_destroy_state = drm_atomic_helper_plane_destroy_state,
 };
 
-static struct drm_plane *sprd_plane_init(struct drm_device *drm,
-					struct sprd_dpu *dpu)
+static struct sprd_plane *sprd_planes_init(struct drm_device *drm)
 {
-	struct drm_plane *primary = NULL;
-	struct sprd_plane *p = NULL;
-	struct dpu_capability cap = {};
-	int err, i;
+	struct sprd_plane *plane, *primary;
+	enum drm_plane_type plane_type;
+	int i;
 
-	if (dpu->core && dpu->core->capability)
-		dpu->core->capability(&dpu->ctx, &cap);
+	for (i = 0; i < 6; i++) {
+		plane_type = (i == 0) ? DRM_PLANE_TYPE_PRIMARY :
+					DRM_PLANE_TYPE_OVERLAY;
 
-	dpu->layers = devm_kcalloc(drm->dev, cap.max_layers,
-				  sizeof(struct sprd_dpu_layer), GFP_KERNEL);
-	if (!dpu->layers)
-		return ERR_PTR(-ENOMEM);
-
-	for (i = 0; i < cap.max_layers; i++) {
-
-		p = devm_kzalloc(drm->dev, sizeof(*p), GFP_KERNEL);
-		if (!p)
-			return ERR_PTR(-ENOMEM);
-
-		err = drm_universal_plane_init(drm, &p->plane, 1,
-					       &sprd_plane_funcs, cap.fmts_ptr,
-					       cap.fmts_cnt, NULL,
-					       DRM_PLANE_TYPE_PRIMARY, NULL);
-		if (err) {
-			DRM_ERROR("fail to init primary plane\n");
-			return ERR_PTR(err);
+		plane = drmm_universal_plane_alloc(drm, struct sprd_plane, base,
+						   1, &sprd_plane_funcs,
+						   layer_fmts, ARRAY_SIZE(layer_fmts),
+						   NULL, plane_type, NULL);
+		if (IS_ERR(plane)) {
+			drm_err(drm, "failed to init drm plane: %d\n", i);
+			return plane;
 		}
 
-		drm_plane_helper_add(&p->plane, &sprd_plane_helper_funcs);
+		drm_plane_helper_add(&plane->base, &sprd_plane_helper_funcs);
 
-		sprd_plane_create_properties(p, i);
+		sprd_plane_create_properties(plane, i);
 
-		p->index = i;
 		if (i == 0)
-			primary = &p->plane;
+			primary = plane;
 	}
-
-	if (p)
-		DRM_INFO("dpu plane init ok\n");
 
 	return primary;
 }
 
 static void sprd_crtc_mode_set_nofb(struct drm_crtc *crtc)
 {
-	struct sprd_dpu *dpu = crtc_to_dpu(crtc);
+	struct sprd_dpu *dpu = to_sprd_crtc(crtc);
 	struct drm_display_mode *mode = &crtc->state->adjusted_mode;
+	struct drm_encoder *encoder;
+	struct sprd_dsi *dsi;
 
-	DRM_INFO("%s() set mode: %s\n", __func__, dpu->mode->name);
+	drm_display_mode_to_videomode(mode, &dpu->ctx.vm);
 
-	/*
-	 * TODO:
-	 * Currently, low simulator resolution only support
-	 * DPI mode, support for EDPI in the future.
-	 */
-	if (mode->type & DRM_MODE_TYPE_BUILTIN) {
-		dpu->ctx.if_type = SPRD_DISPC_IF_DPI;
-		return;
+	drm_for_each_encoder_mask(encoder, crtc->dev,
+				  crtc->state->encoder_mask) {
+		dsi = encoder_to_dsi(encoder);
+
+		if (dsi->slave->mode_flags & MIPI_DSI_MODE_VIDEO)
+			dpu->ctx.if_type = SPRD_DPU_IF_DPI;
+		else
+			dpu->ctx.if_type = SPRD_DPU_IF_EDPI;
 	}
 
-	if ((dpu->mode->hdisplay == dpu->mode->htotal) ||
-	    (dpu->mode->vdisplay == dpu->mode->vtotal))
-		dpu->ctx.if_type = SPRD_DISPC_IF_EDPI;
-	else
-		dpu->ctx.if_type = SPRD_DISPC_IF_DPI;
-
-	if (dpu->core && dpu->core->modeset) {
-		if (crtc->state->mode_changed) {
-			struct drm_mode_modeinfo umode;
-
-			drm_mode_convert_to_umode(&umode, mode);
-			dpu->core->modeset(&dpu->ctx, &umode);
-		}
-	}
-}
-
-static enum drm_mode_status sprd_crtc_mode_valid(struct drm_crtc *crtc,
-					const struct drm_display_mode *mode)
-{
-	struct sprd_dpu *dpu = crtc_to_dpu(crtc);
-
-	DRM_INFO("%s() mode: "DRM_MODE_FMT"\n", __func__, DRM_MODE_ARG(mode));
-
-	if (mode->type & DRM_MODE_TYPE_DEFAULT)
-		dpu->mode = (struct drm_display_mode *)mode;
-
-	if (mode->type & DRM_MODE_TYPE_PREFERRED) {
-		dpu->mode = (struct drm_display_mode *)mode;
-		drm_display_mode_to_videomode(dpu->mode, &dpu->ctx.vm);
-	}
-
-	if (mode->type & DRM_MODE_TYPE_BUILTIN)
-		dpu->mode = (struct drm_display_mode *)mode;
-
-	return MODE_OK;
+	sprd_dpi_init(dpu);
 }
 
 static void sprd_crtc_atomic_enable(struct drm_crtc *crtc,
-				   struct drm_crtc_state *old_state)
+				    struct drm_atomic_state *state)
 {
-	struct sprd_dpu *dpu = crtc_to_dpu(crtc);
-	static bool is_enabled = true;
-
-	DRM_INFO("%s()\n", __func__);
-
-	/*
-	 * add if condition to avoid resume dpu for SR feature.
-	 */
-	if (crtc->state->mode_changed && !crtc->state->active_changed)
-		return;
-
-	if (is_enabled)
-		is_enabled = false;
-	else
-		pm_runtime_get_sync(dpu->dev.parent);
+	struct sprd_dpu *dpu = to_sprd_crtc(crtc);
 
 	sprd_dpu_init(dpu);
 
-	enable_irq(dpu->ctx.irq);
-
-	sprd_iommu_restore(&dpu->dev);
-}
-
-static void sprd_crtc_wait_last_commit_complete(struct drm_crtc *crtc)
-{
-	struct drm_crtc_commit *commit;
-	int ret, i = 0;
-
-	spin_lock(&crtc->commit_lock);
-	list_for_each_entry(commit, &crtc->commit_list, commit_entry) {
-		i++;
-		/* skip the first entry, that's the current commit */
-		if (i == 2)
-			break;
-	}
-	if (i == 2)
-		drm_crtc_commit_get(commit);
-	spin_unlock(&crtc->commit_lock);
-
-	if (i != 2)
-		return;
-
-	ret = wait_for_completion_interruptible_timeout(&commit->cleanup_done,
-							HZ);
-	if (ret == 0)
-		DRM_WARN("wait last commit completion timed out\n");
-
-	drm_crtc_commit_put(commit);
+	drm_crtc_vblank_on(&dpu->base);
 }
 
 static void sprd_crtc_atomic_disable(struct drm_crtc *crtc,
-				    struct drm_crtc_state *old_state)
+				     struct drm_atomic_state *state)
 {
-	struct sprd_dpu *dpu = crtc_to_dpu(crtc);
-	struct drm_device *drm = dpu->crtc.dev;
+	struct sprd_dpu *dpu = to_sprd_crtc(crtc);
+	struct drm_device *drm = dpu->base.dev;
 
-	DRM_INFO("%s()\n", __func__);
+	drm_crtc_vblank_off(&dpu->base);
 
-	/* add if condition to avoid suspend dpu for SR feature */
-	if (crtc->state->mode_changed && !crtc->state->active_changed)
-		return;
-
-	sprd_crtc_wait_last_commit_complete(crtc);
-
-	disable_irq(dpu->ctx.irq);
-
-	sprd_dpu_uninit(dpu);
-
-	pm_runtime_put(dpu->dev.parent);
+	sprd_dpu_fini(dpu);
 
 	spin_lock_irq(&drm->event_lock);
 	if (crtc->state->event) {
@@ -731,44 +663,14 @@ static void sprd_crtc_atomic_disable(struct drm_crtc *crtc,
 	spin_unlock_irq(&drm->event_lock);
 }
 
-static int sprd_crtc_atomic_check(struct drm_crtc *crtc,
-				 struct drm_crtc_state *state)
-{
-	DRM_DEBUG("%s()\n", __func__);
-
-	return 0;
-}
-
-static void sprd_crtc_atomic_begin(struct drm_crtc *crtc,
-				  struct drm_crtc_state *old_state)
-{
-	struct sprd_dpu *dpu = crtc_to_dpu(crtc);
-
-	DRM_DEBUG("%s()\n", __func__);
-
-	down(&dpu->ctx.refresh_lock);
-
-	memset(dpu->layers, 0, sizeof(*dpu->layers) * dpu->pending_planes);
-
-	dpu->pending_planes = 0;
-}
-
 static void sprd_crtc_atomic_flush(struct drm_crtc *crtc,
-				  struct drm_crtc_state *old_state)
+				   struct drm_atomic_state *state)
 
 {
-	struct sprd_dpu *dpu = crtc_to_dpu(crtc);
-	struct drm_device *drm = dpu->crtc.dev;
+	struct sprd_dpu *dpu = to_sprd_crtc(crtc);
+	struct drm_device *drm = dpu->base.dev;
 
-	DRM_DEBUG("%s()\n", __func__);
-
-	if (dpu->core && dpu->core->flip &&
-	    dpu->pending_planes && !dpu->ctx.disable_flip) {
-		dpu->core->flip(&dpu->ctx, dpu->layers, dpu->pending_planes);
-		frame_count++;
-	}
-
-	up(&dpu->ctx.refresh_lock);
+	sprd_dpu_flip(dpu);
 
 	spin_lock_irq(&drm->event_lock);
 	if (crtc->state->event) {
@@ -780,71 +682,22 @@ static void sprd_crtc_atomic_flush(struct drm_crtc *crtc,
 
 static int sprd_crtc_enable_vblank(struct drm_crtc *crtc)
 {
-	struct sprd_dpu *dpu = crtc_to_dpu(crtc);
+	struct sprd_dpu *dpu = to_sprd_crtc(crtc);
 
-	DRM_DEBUG("%s()\n", __func__);
-
-	if (dpu->core && dpu->core->enable_vsync)
-		dpu->core->enable_vsync(&dpu->ctx);
+	dpu_reg_set(&dpu->ctx, REG_DPU_INT_EN, BIT_DPU_INT_VSYNC);
 
 	return 0;
 }
 
 static void sprd_crtc_disable_vblank(struct drm_crtc *crtc)
 {
-	struct sprd_dpu *dpu = crtc_to_dpu(crtc);
+	struct sprd_dpu *dpu = to_sprd_crtc(crtc);
 
-	DRM_DEBUG("%s()\n", __func__);
-
-	if (dpu->core && dpu->core->disable_vsync)
-		dpu->core->disable_vsync(&dpu->ctx);
-}
-
-static int sprd_crtc_create_properties(struct drm_crtc *crtc)
-{
-	struct sprd_dpu *dpu = crtc_to_dpu(crtc);
-	struct drm_device *drm = dpu->crtc.dev;
-	struct drm_property *prop;
-	struct drm_property_blob *blob;
-	size_t blob_size;
-
-	blob_size = strlen(dpu->ctx.version) + 1;
-
-	blob = drm_property_create_blob(dpu->crtc.dev, blob_size,
-			dpu->ctx.version);
-	if (IS_ERR(blob)) {
-		DRM_ERROR("drm_property_create_blob dpu version failed\n");
-		return PTR_ERR(blob);
-	}
-
-	/* create dpu version property */
-	prop = drm_property_create(drm,
-		DRM_MODE_PROP_IMMUTABLE | DRM_MODE_PROP_BLOB,
-		"dpu version", 0);
-	if (!prop) {
-		DRM_ERROR("drm_property_create dpu version failed\n");
-		return -ENOMEM;
-	}
-	drm_object_attach_property(&crtc->base, prop, blob->base.id);
-
-	/* create corner size property */
-	prop = drm_property_create(drm,
-		DRM_MODE_PROP_IMMUTABLE | DRM_MODE_PROP_RANGE,
-		"corner size", 0);
-	if (!prop) {
-		DRM_ERROR("drm_property_create corner size failed\n");
-		return -ENOMEM;
-	}
-	drm_object_attach_property(&crtc->base, prop, dpu->ctx.corner_size);
-
-	return 0;
+	dpu_reg_clr(&dpu->ctx, REG_DPU_INT_EN, BIT_DPU_INT_VSYNC);
 }
 
 static const struct drm_crtc_helper_funcs sprd_crtc_helper_funcs = {
 	.mode_set_nofb	= sprd_crtc_mode_set_nofb,
-	.mode_valid	= sprd_crtc_mode_valid,
-	.atomic_check	= sprd_crtc_atomic_check,
-	.atomic_begin	= sprd_crtc_atomic_begin,
 	.atomic_flush	= sprd_crtc_atomic_flush,
 	.atomic_enable	= sprd_crtc_atomic_enable,
 	.atomic_disable	= sprd_crtc_atomic_disable,
@@ -861,205 +714,107 @@ static const struct drm_crtc_funcs sprd_crtc_funcs = {
 	.disable_vblank	= sprd_crtc_disable_vblank,
 };
 
-static int sprd_crtc_init(struct drm_device *drm, struct drm_crtc *crtc,
-			 struct drm_plane *primary)
+static struct sprd_dpu *sprd_crtc_init(struct drm_device *drm,
+				       struct drm_plane *primary, struct device *dev)
 {
 	struct device_node *port;
-	int err;
+	struct sprd_dpu *dpu;
+
+	dpu = drmm_crtc_alloc_with_planes(drm, struct sprd_dpu, base,
+					  primary, NULL,
+					&sprd_crtc_funcs, NULL);
+	if (IS_ERR(dpu)) {
+		drm_err(drm, "failed to init crtc\n");
+		return dpu;
+	}
+	drm_crtc_helper_add(&dpu->base, &sprd_crtc_helper_funcs);
 
 	/*
 	 * set crtc port so that drm_of_find_possible_crtcs call works
 	 */
-	port = of_parse_phandle(drm->dev->of_node, "ports", 0);
+	port = of_graph_get_port_by_id(dev->of_node, 0);
 	if (!port) {
-		DRM_ERROR("find 'ports' phandle of %s failed\n",
-			  drm->dev->of_node->full_name);
-		return -EINVAL;
+		drm_err(drm, "failed to found crtc output port for %s\n",
+			dev->of_node->full_name);
+		return ERR_PTR(-EINVAL);
 	}
+	dpu->base.port = port;
 	of_node_put(port);
-	crtc->port = port;
 
-	err = drm_crtc_init_with_planes(drm, crtc, primary, NULL,
-					&sprd_crtc_funcs, NULL);
-	if (err) {
-		DRM_ERROR("failed to init crtc.\n");
-		return err;
-	}
-
-	drm_mode_crtc_set_gamma_size(crtc, 256);
-
-	drm_crtc_helper_add(crtc, &sprd_crtc_helper_funcs);
-
-	sprd_crtc_create_properties(crtc);
-
-	DRM_INFO("%s() ok\n", __func__);
-	return 0;
-}
-
-int sprd_dpu_run(struct sprd_dpu *dpu)
-{
-	struct dpu_context *ctx = &dpu->ctx;
-
-	down(&ctx->refresh_lock);
-
-	if (!ctx->is_inited) {
-		DRM_ERROR("dpu is not initialized\n");
-		up(&ctx->refresh_lock);
-		return -EINVAL;
-	}
-
-	if (!ctx->is_stopped) {
-		up(&ctx->refresh_lock);
-		return 0;
-	}
-
-	if (dpu->core && dpu->core->run)
-		dpu->core->run(ctx);
-
-	up(&ctx->refresh_lock);
-
-	drm_crtc_vblank_on(&dpu->crtc);
-
-	return 0;
-}
-
-int sprd_dpu_stop(struct sprd_dpu *dpu)
-{
-	struct dpu_context *ctx = &dpu->ctx;
-
-	down(&ctx->refresh_lock);
-
-	if (!ctx->is_inited) {
-		DRM_ERROR("dpu is not initialized\n");
-		up(&ctx->refresh_lock);
-		return -EINVAL;
-	}
-
-	if (ctx->is_stopped) {
-		up(&ctx->refresh_lock);
-		return 0;
-	}
-
-	if (dpu->core && dpu->core->stop)
-		dpu->core->stop(ctx);
-
-	up(&ctx->refresh_lock);
-
-	drm_crtc_handle_vblank(&dpu->crtc);
-	drm_crtc_vblank_off(&dpu->crtc);
-
-	return 0;
-}
-
-static int sprd_dpu_init(struct sprd_dpu *dpu)
-{
-	struct dpu_context *ctx = &dpu->ctx;
-
-	down(&ctx->refresh_lock);
-
-	if (dpu->ctx.is_inited) {
-		up(&ctx->refresh_lock);
-		return 0;
-	}
-
-	if (dpu->glb && dpu->glb->power)
-		dpu->glb->power(ctx, true);
-	if (dpu->glb && dpu->glb->enable)
-		dpu->glb->enable(ctx);
-
-	if (ctx->is_stopped && dpu->glb && dpu->glb->reset)
-		dpu->glb->reset(ctx);
-
-	if (dpu->clk && dpu->clk->init)
-		dpu->clk->init(ctx);
-	if (dpu->clk && dpu->clk->enable)
-		dpu->clk->enable(ctx);
-
-	if (dpu->core && dpu->core->init)
-		dpu->core->init(ctx);
-	if (dpu->core && dpu->core->ifconfig)
-		dpu->core->ifconfig(ctx);
-
-	ctx->is_inited = true;
-
-	up(&ctx->refresh_lock);
-
-	return 0;
-}
-
-static int sprd_dpu_uninit(struct sprd_dpu *dpu)
-{
-	struct dpu_context *ctx = &dpu->ctx;
-
-	down(&ctx->refresh_lock);
-
-	if (!dpu->ctx.is_inited) {
-		up(&ctx->refresh_lock);
-		return 0;
-	}
-
-	if (dpu->core && dpu->core->uninit)
-		dpu->core->uninit(ctx);
-	if (dpu->clk && dpu->clk->disable)
-		dpu->clk->disable(ctx);
-	if (dpu->glb && dpu->glb->disable)
-		dpu->glb->disable(ctx);
-	if (dpu->glb && dpu->glb->power)
-		dpu->glb->power(ctx, false);
-
-	ctx->is_inited = false;
-
-	up(&ctx->refresh_lock);
-
-	return 0;
+	return dpu;
 }
 
 static irqreturn_t sprd_dpu_isr(int irq, void *data)
 {
 	struct sprd_dpu *dpu = data;
 	struct dpu_context *ctx = &dpu->ctx;
-	u32 int_mask = 0;
+	u32 reg_val, int_mask = 0;
 
-	if (dpu->core && dpu->core->isr)
-		int_mask = dpu->core->isr(ctx);
+	reg_val = readl(ctx->base + REG_DPU_INT_STS);
 
-	if (int_mask & DISPC_INT_TE_MASK) {
-		if (ctx->te_check_en) {
-			ctx->evt_te = true;
-			wake_up_interruptible_all(&ctx->te_wq);
-		}
+	/* disable err interrupt */
+	if (reg_val & BIT_DPU_INT_ERR) {
+		int_mask |= BIT_DPU_INT_ERR;
+		drm_warn(dpu->drm, "Warning: dpu underflow!\n");
 	}
 
-	if (int_mask & DISPC_INT_ERR_MASK)
-		DRM_WARN("Warning: dpu underflow!\n");
+	/* dpu update done isr */
+	if (reg_val & BIT_DPU_INT_UPDATE_DONE) {
+		ctx->evt_update = true;
+		wake_up_interruptible_all(&ctx->wait_queue);
+	}
 
-	if ((int_mask & DISPC_INT_DPI_VSYNC_MASK) && ctx->is_inited)
-		drm_crtc_handle_vblank(&dpu->crtc);
+	/* dpu stop done isr */
+	if (reg_val & BIT_DPU_INT_DONE) {
+		ctx->evt_stop = true;
+		wake_up_interruptible_all(&ctx->wait_queue);
+	}
+
+	if (reg_val & BIT_DPU_INT_VSYNC)
+		drm_crtc_handle_vblank(&dpu->base);
+
+	writel(reg_val, ctx->base + REG_DPU_INT_CLR);
+	dpu_reg_clr(ctx, REG_DPU_INT_EN, int_mask);
 
 	return IRQ_HANDLED;
 }
 
-static int sprd_dpu_irq_request(struct sprd_dpu *dpu)
+static int sprd_dpu_context_init(struct sprd_dpu *dpu,
+				 struct device *dev)
 {
-	int err;
-	int irq_num;
+	struct platform_device *pdev = to_platform_device(dev);
+	struct dpu_context *ctx = &dpu->ctx;
+	struct resource *res;
+	int ret;
 
-	irq_num = irq_of_parse_and_map(dpu->dev.of_node, 0);
-	if (!irq_num) {
-		DRM_ERROR("error: dpu parse irq num failed\n");
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!res) {
+		dev_err(dev, "failed to get I/O resource\n");
 		return -EINVAL;
 	}
-	DRM_INFO("dpu irq_num = %d\n", irq_num);
 
-	irq_set_status_flags(irq_num, IRQ_NOAUTOEN);
-	err = devm_request_irq(&dpu->dev, irq_num, sprd_dpu_isr,
-					0, "DISPC", dpu);
-	if (err) {
-		DRM_ERROR("error: dpu request irq failed\n");
-		return -EINVAL;
+	ctx->base = devm_ioremap(dev, res->start, resource_size(res));
+	if (!ctx->base) {
+		dev_err(dev, "failed to map dpu registers\n");
+		return -EFAULT;
 	}
-	dpu->ctx.irq = irq_num;
-	dpu->ctx.dpu_isr = sprd_dpu_isr;
+
+	ctx->irq = platform_get_irq(pdev, 0);
+	if (ctx->irq < 0)
+		return ctx->irq;
+
+	/* disable and clear interrupts before register dpu IRQ. */
+	writel(0x00, ctx->base + REG_DPU_INT_EN);
+	writel(0xff, ctx->base + REG_DPU_INT_CLR);
+
+	ret = devm_request_irq(dev, ctx->irq, sprd_dpu_isr,
+			       IRQF_TRIGGER_NONE, "DPU", dpu);
+	if (ret) {
+		dev_err(dev, "failed to register dpu irq handler\n");
+		return ret;
+	}
+
+	init_waitqueue_head(&ctx->wait_queue);
 
 	return 0;
 }
@@ -1067,167 +822,58 @@ static int sprd_dpu_irq_request(struct sprd_dpu *dpu)
 static int sprd_dpu_bind(struct device *dev, struct device *master, void *data)
 {
 	struct drm_device *drm = data;
-	struct sprd_drm *sprd = drm->dev_private;
-	struct sprd_dpu *dpu = dev_get_drvdata(dev);
-	struct drm_plane *plane;
-	int err;
+	struct sprd_dpu *dpu;
+	struct sprd_plane *plane;
+	int ret;
 
-	DRM_INFO("%s()\n", __func__);
+	plane = sprd_planes_init(drm);
+	if (IS_ERR(plane))
+		return PTR_ERR(plane);
 
-	plane = sprd_plane_init(drm, dpu);
-	if (IS_ERR_OR_NULL(plane)) {
-		err = PTR_ERR(plane);
-		return err;
-	}
+	dpu = sprd_crtc_init(drm, &plane->base, dev);
+	if (IS_ERR(dpu))
+		return PTR_ERR(dpu);
 
-	err = sprd_crtc_init(drm, &dpu->crtc, plane);
-	if (err)
-		return err;
+	dpu->drm = drm;
+	dev_set_drvdata(dev, dpu);
 
-	sprd_dpu_irq_request(dpu);
-
-	sprd->dpu_dev = dev;
+	ret = sprd_dpu_context_init(dpu, dev);
+	if (ret)
+		return ret;
 
 	return 0;
-}
-
-static void sprd_dpu_unbind(struct device *dev, struct device *master,
-	void *data)
-{
-	struct sprd_dpu *dpu = dev_get_drvdata(dev);
-
-	DRM_INFO("%s()\n", __func__);
-
-	drm_crtc_cleanup(&dpu->crtc);
 }
 
 static const struct component_ops dpu_component_ops = {
 	.bind = sprd_dpu_bind,
-	.unbind = sprd_dpu_unbind,
 };
 
-static int sprd_dpu_device_create(struct sprd_dpu *dpu,
-				struct device *parent)
-{
-	int err;
-
-	dpu->dev.class = display_class;
-	dpu->dev.parent = parent;
-	dpu->dev.of_node = parent->of_node;
-	dev_set_name(&dpu->dev, "dispc%d", dpu->ctx.id);
-	dev_set_drvdata(&dpu->dev, dpu);
-
-	err = device_register(&dpu->dev);
-	if (err)
-		DRM_ERROR("dpu device register failed\n");
-
-	return err;
-}
-
-static int sprd_dpu_context_init(struct sprd_dpu *dpu,
-				struct device_node *np)
-{
-	u32 temp;
-	struct resource r;
-	struct dpu_context *ctx = &dpu->ctx;
-
-	if (dpu->core && dpu->core->parse_dt)
-		dpu->core->parse_dt(&dpu->ctx, np);
-	if (dpu->clk && dpu->clk->parse_dt)
-		dpu->clk->parse_dt(&dpu->ctx, np);
-	if (dpu->glb && dpu->glb->parse_dt)
-		dpu->glb->parse_dt(&dpu->ctx, np);
-
-	if (of_property_read_bool(np, "sprd,initial-stop-state")) {
-		DRM_WARN("DPU is not initialized before entering kernel\n");
-		dpu->ctx.is_stopped = true;
-	}
-
-	if (!of_property_read_u32(np, "sprd,dev-id", &temp))
-		ctx->id = temp;
-
-	if (of_address_to_resource(np, 0, &r)) {
-		DRM_ERROR("parse dt base address failed\n");
-		return -ENODEV;
-	}
-	ctx->base = (unsigned long)ioremap_nocache(r.start,
-					resource_size(&r));
-	if (ctx->base == 0) {
-		DRM_ERROR("ioremap base address failed\n");
-		return -EFAULT;
-	}
-
-	of_get_logo_memory_info(dpu, np);
-
-	sema_init(&ctx->refresh_lock, 1);
-
-	return 0;
-}
+static const struct of_device_id dpu_match_table[] = {
+	{ .compatible = "sprd,sharkl3-dpu" },
+	{ /* sentinel */ },
+};
+MODULE_DEVICE_TABLE(of, dpu_match_table);
 
 static int sprd_dpu_probe(struct platform_device *pdev)
 {
-	struct device_node *np = pdev->dev.of_node;
-	struct sprd_dpu *dpu;
-	const char *str;
-	int ret;
-
-	if (calibration_mode) {
-		DRM_WARN("Calibration Mode! Don't register sprd dpu driver\n");
-		return -ENODEV;
-	}
-
-	dpu = devm_kzalloc(&pdev->dev, sizeof(*dpu), GFP_KERNEL);
-	if (!dpu)
-		return -ENOMEM;
-
-	if (!of_property_read_string(np, "sprd,ip", &str)) {
-		dpu->core = dpu_core_ops_attach(str);
-		dpu->ctx.version = str;
-	} else
-		DRM_WARN("sprd,ip was not found\n");
-
-	if (!of_property_read_string(np, "sprd,soc", &str)) {
-		dpu->clk = dpu_clk_ops_attach(str);
-		dpu->glb = dpu_glb_ops_attach(str);
-	} else
-		DRM_WARN("sprd,soc was not found\n");
-
-	ret = sprd_dpu_context_init(dpu, np);
-	if (ret)
-		return ret;
-
-	sprd_dpu_device_create(dpu, &pdev->dev);
-	sprd_dpu_sysfs_init(&dpu->dev);
-	platform_set_drvdata(pdev, dpu);
-
-	pm_runtime_set_active(&pdev->dev);
-	pm_runtime_get_noresume(&pdev->dev);
-	pm_runtime_enable(&pdev->dev);
-
 	return component_add(&pdev->dev, &dpu_component_ops);
 }
 
-static int sprd_dpu_remove(struct platform_device *pdev)
+static void sprd_dpu_remove(struct platform_device *pdev)
 {
 	component_del(&pdev->dev, &dpu_component_ops);
-	return 0;
 }
 
-static const struct of_device_id dpu_match_table[] = {
-	{ .compatible = "sprd,display-processor",},
-	{},
-};
-
-static struct platform_driver sprd_dpu_driver = {
+struct platform_driver sprd_dpu_driver = {
 	.probe = sprd_dpu_probe,
-	.remove = sprd_dpu_remove,
+	.remove_new = sprd_dpu_remove,
 	.driver = {
 		.name = "sprd-dpu-drv",
 		.of_match_table = dpu_match_table,
 	},
 };
-module_platform_driver(sprd_dpu_driver);
 
 MODULE_AUTHOR("Leon He <leon.he@unisoc.com>");
-MODULE_DESCRIPTION("SPRD Display Controller Driver");
+MODULE_AUTHOR("Kevin Tang <kevin.tang@unisoc.com>");
+MODULE_DESCRIPTION("Unisoc Display Controller Driver");
 MODULE_LICENSE("GPL v2");

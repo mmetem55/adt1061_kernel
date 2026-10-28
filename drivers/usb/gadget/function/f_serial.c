@@ -1,13 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0+
 /*
  * f_serial.c - generic USB serial function driver
  *
  * Copyright (C) 2003 Al Borchers (alborchers@steinerpoint.com)
  * Copyright (C) 2008 by David Brownell
  * Copyright (C) 2008 by Nokia Corporation
- *
- * This software is distributed under the terms of the GNU General
- * Public License ("GPL") as published by the Free Software Foundation,
- * either version 2 of that License or (at your option) any later version.
  */
 
 #include <linux/slab.h>
@@ -186,58 +183,6 @@ static void gser_disable(struct usb_function *f)
 
 /* serial function driver setup/binding */
 
-static void gser_setup_complete(struct usb_ep *ep, struct usb_request *req)
-{
-}
-
-/*
- * To compatible with our company's usb-to-serial driver, we need to handle the
- * request defining the bRequestType = 0x21 and bRequest = 0x22 to make the
- * usb-to-serial driver work well.
- */
-static int gser_setup(struct usb_function *f,
-		      const struct usb_ctrlrequest *ctrl)
-{
-	struct usb_composite_dev *cdev = f->config->cdev;
-	u16 w_length = le16_to_cpu(ctrl->wLength);
-	int value = -EOPNOTSUPP;
-
-	/* Handle Bulk-only class-specific requests */
-	if ((ctrl->bRequestType & USB_TYPE_MASK) == USB_TYPE_CLASS) {
-		switch (ctrl->bRequest) {
-		case 0x22:
-			value = 0;
-			break;
-		default:
-			break;
-		}
-	}
-
-	/* Respond with data transfer or status phase? */
-	if (value >= 0) {
-		int rc;
-
-		cdev->req->zero = value < w_length;
-		cdev->req->length = value;
-		cdev->req->complete = gser_setup_complete;
-		rc = usb_ep_queue(cdev->gadget->ep0, cdev->req, GFP_ATOMIC);
-		if (rc < 0)
-			dev_err(&cdev->gadget->dev,
-				"setup response queue error\n");
-	}
-
-	if (value == -EOPNOTSUPP) {
-		dev_warn(&cdev->gadget->dev,
-			 "unknown class-specific control req "
-			 "%02x.%02x v%04x i%04x l%u\n",
-			 ctrl->bRequestType, ctrl->bRequest,
-			 le16_to_cpu(ctrl->wValue), le16_to_cpu(ctrl->wIndex),
-			 le16_to_cpu(ctrl->wLength));
-	}
-
-	return value;
-}
-
 static int gser_bind(struct usb_configuration *c, struct usb_function *f)
 {
 	struct usb_composite_dev *cdev = c->cdev;
@@ -288,13 +233,11 @@ static int gser_bind(struct usb_configuration *c, struct usb_function *f)
 	gser_ss_out_desc.bEndpointAddress = gser_fs_out_desc.bEndpointAddress;
 
 	status = usb_assign_descriptors(f, gser_fs_function, gser_hs_function,
-			gser_ss_function, NULL);
+			gser_ss_function, gser_ss_function);
 	if (status)
 		goto fail;
-	dev_dbg(&cdev->gadget->dev, "generic ttyGS%d: %s speed IN/%s OUT/%s\n",
+	dev_dbg(&cdev->gadget->dev, "generic ttyGS%d: IN/%s OUT/%s\n",
 		gser->port_num,
-		gadget_is_superspeed(c->cdev->gadget) ? "super" :
-		gadget_is_dualspeed(c->cdev->gadget) ? "dual" : "full",
 		gser->port.in->name, gser->port.out->name);
 	return 0;
 
@@ -321,6 +264,24 @@ static struct configfs_item_operations serial_item_ops = {
 	.release	= serial_attr_release,
 };
 
+#ifdef CONFIG_U_SERIAL_CONSOLE
+
+static ssize_t f_serial_console_store(struct config_item *item,
+		const char *page, size_t count)
+{
+	return gserial_set_console(to_f_serial_opts(item)->port_num,
+				   page, count);
+}
+
+static ssize_t f_serial_console_show(struct config_item *item, char *page)
+{
+	return gserial_get_console(to_f_serial_opts(item)->port_num, page);
+}
+
+CONFIGFS_ATTR(f_serial_, console);
+
+#endif /* CONFIG_U_SERIAL_CONSOLE */
+
 static ssize_t f_serial_port_num_show(struct config_item *item, char *page)
 {
 	return sprintf(page, "%u\n", to_f_serial_opts(item)->port_num);
@@ -329,11 +290,14 @@ static ssize_t f_serial_port_num_show(struct config_item *item, char *page)
 CONFIGFS_ATTR_RO(f_serial_, port_num);
 
 static struct configfs_attribute *acm_attrs[] = {
+#ifdef CONFIG_U_SERIAL_CONSOLE
+	&f_serial_attr_console,
+#endif
 	&f_serial_attr_port_num,
 	NULL,
 };
 
-static struct config_item_type serial_func_type = {
+static const struct config_item_type serial_func_type = {
 	.ct_item_ops	= &serial_item_ops,
 	.ct_attrs	= acm_attrs,
 	.ct_owner	= THIS_MODULE,
@@ -379,7 +343,25 @@ static void gser_free(struct usb_function *f)
 
 static void gser_unbind(struct usb_configuration *c, struct usb_function *f)
 {
+	struct f_gser	*gser = func_to_gser(f);
+
+	/* Ensure port is disconnected before unbinding */
+	gserial_disconnect(&gser->port);
 	usb_free_all_descriptors(f);
+}
+
+static void gser_resume(struct usb_function *f)
+{
+	struct f_gser *gser = func_to_gser(f);
+
+	gserial_resume(&gser->port);
+}
+
+static void gser_suspend(struct usb_function *f)
+{
+	struct f_gser *gser = func_to_gser(f);
+
+	gserial_suspend(&gser->port);
 }
 
 static struct usb_function *gser_alloc(struct usb_function_instance *fi)
@@ -401,14 +383,16 @@ static struct usb_function *gser_alloc(struct usb_function_instance *fi)
 	gser->port.func.bind = gser_bind;
 	gser->port.func.unbind = gser_unbind;
 	gser->port.func.set_alt = gser_set_alt;
-	gser->port.func.setup = gser_setup;
 	gser->port.func.disable = gser_disable;
 	gser->port.func.free_func = gser_free;
+	gser->port.func.resume = gser_resume;
+	gser->port.func.suspend = gser_suspend;
 
 	return &gser->port.func;
 }
 
 DECLARE_USB_FUNCTION_INIT(gser, gser_alloc_inst, gser_alloc);
+MODULE_DESCRIPTION("generic USB serial function driver");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Al Borchers");
 MODULE_AUTHOR("David Brownell");

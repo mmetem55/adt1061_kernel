@@ -8,10 +8,12 @@
 #include <linux/personality.h>
 #include <linux/ptrace.h>
 #include <linux/kernel.h>
+#include <linux/syscalls.h>
 #include <asm/unistd.h>
 #include <linux/uaccess.h>
 #include <asm/ucontext.h>
 #include <frame_kern.h>
+#include <registers.h>
 #include <skas.h>
 
 #ifdef CONFIG_X86_32
@@ -154,7 +156,7 @@ static int copy_sc_from_user(struct pt_regs *regs,
 			     struct sigcontext __user *from)
 {
 	struct sigcontext sc;
-	int err, pid;
+	int err;
 
 	/* Always make any pending restarted system calls return -EINTR */
 	current->restart_block.fn = do_no_restart_syscall;
@@ -200,10 +202,10 @@ static int copy_sc_from_user(struct pt_regs *regs,
 
 #undef GETREG
 
-	pid = userspace_pid[current_thread_info()->cpu];
 #ifdef CONFIG_X86_32
 	if (have_fpx_regs) {
 		struct user_fxsr_struct fpx;
+		int pid = userspace_pid[current_thread_info()->cpu];
 
 		err = copy_from_user(&fpx,
 			&((struct _fpstate __user *)sc.fpstate)->_fxsr_env[0],
@@ -239,7 +241,7 @@ static int copy_sc_to_user(struct sigcontext __user *to,
 {
 	struct sigcontext sc;
 	struct faultinfo * fi = &current->thread.arch.faultinfo;
-	int err, pid;
+	int err;
 	memset(&sc, 0, sizeof(struct sigcontext));
 
 #define PUTREG(regno, regname) sc.regname = regs->regs.gp[HOST_##regno]
@@ -287,10 +289,9 @@ static int copy_sc_to_user(struct sigcontext __user *to,
 	if (err)
 		return 1;
 
-	pid = userspace_pid[current_thread_info()->cpu];
-
 #ifdef CONFIG_X86_32
 	if (have_fpx_regs) {
+		int pid = userspace_pid[current_thread_info()->cpu];
 		struct user_fxsr_struct fpx;
 
 		err = save_fpx_registers(pid, (unsigned long *) &fpx);
@@ -367,7 +368,7 @@ int setup_signal_stack_sc(unsigned long stack_top, struct ksignal *ksig,
 	/* This is the same calculation as i386 - ((sp + 4) & 15) == 0 */
 	stack_top = ((stack_top + 4) & -16UL) - 4;
 	frame = (struct sigframe __user *) stack_top - 1;
-	if (!access_ok(VERIFY_WRITE, frame, sizeof(*frame)))
+	if (!access_ok(frame, sizeof(*frame)))
 		return 1;
 
 	restorer = frame->retcode;
@@ -412,7 +413,7 @@ int setup_signal_stack_si(unsigned long stack_top, struct ksignal *ksig,
 
 	stack_top &= -8UL;
 	frame = (struct rt_sigframe __user *) stack_top - 1;
-	if (!access_ok(VERIFY_WRITE, frame, sizeof(*frame)))
+	if (!access_ok(frame, sizeof(*frame)))
 		return 1;
 
 	restorer = frame->retcode;
@@ -449,7 +450,7 @@ int setup_signal_stack_si(unsigned long stack_top, struct ksignal *ksig,
 	return 0;
 }
 
-long sys_sigreturn(void)
+SYSCALL_DEFINE0(sigreturn)
 {
 	unsigned long sp = PT_REGS_SP(&current->thread.regs);
 	struct sigframe __user *frame = (struct sigframe __user *)(sp - 8);
@@ -471,7 +472,7 @@ long sys_sigreturn(void)
 	return PT_REGS_SYSCALL_RET(&current->thread.regs);
 
  segfault:
-	force_sig(SIGSEGV, current);
+	force_sig(SIGSEGV);
 	return 0;
 }
 
@@ -497,7 +498,7 @@ int setup_signal_stack_si(unsigned long stack_top, struct ksignal *ksig,
 	/* Subtract 128 for a red zone and 8 for proper alignment */
 	frame = (struct rt_sigframe __user *) ((unsigned long) frame - 128 - 8);
 
-	if (!access_ok(VERIFY_WRITE, frame, sizeof(*frame)))
+	if (!access_ok(frame, sizeof(*frame)))
 		goto out;
 
 	if (ksig->ka.sa.sa_flags & SA_SIGINFO) {
@@ -556,7 +557,7 @@ int setup_signal_stack_si(unsigned long stack_top, struct ksignal *ksig,
 }
 #endif
 
-long sys_rt_sigreturn(void)
+SYSCALL_DEFINE0(rt_sigreturn)
 {
 	unsigned long sp = PT_REGS_SP(&current->thread.regs);
 	struct rt_sigframe __user *frame =
@@ -577,6 +578,6 @@ long sys_rt_sigreturn(void)
 	return PT_REGS_SYSCALL_RET(&current->thread.regs);
 
  segfault:
-	force_sig(SIGSEGV, current);
+	force_sig(SIGSEGV);
 	return 0;
 }

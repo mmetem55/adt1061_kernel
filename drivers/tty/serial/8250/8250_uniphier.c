@@ -1,15 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0+
 /*
  * Copyright (C) 2015 Masahiro Yamada <yamada.masahiro@socionext.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
  */
 
 #include <linux/clk.h>
@@ -20,9 +11,6 @@
 #include <linux/platform_device.h>
 
 #include "8250.h"
-
-/* Most (but not all) of UniPhier UART devices have 64-depth FIFO. */
-#define UNIPHIER_UART_DEFAULT_FIFO_SIZE	64
 
 /*
  * This hardware is similar to 8250, but its register map is a bit different:
@@ -87,7 +75,7 @@ static unsigned int uniphier_serial_in(struct uart_port *p, int offset)
 		break;
 	case UART_LCR:
 		valshift = 8;
-		/* fall through */
+		fallthrough;
 	case UART_MCR:
 		offset = UNIPHIER_UART_LCR_MCR;
 		break;
@@ -113,7 +101,7 @@ static void uniphier_serial_out(struct uart_port *p, int offset, int value)
 	case UART_SCR:
 		/* No SCR for this hardware.  Use CHAR as a scratch register */
 		valshift = 8;
-		/* fall through */
+		fallthrough;
 	case UART_FCR:
 		offset = UNIPHIER_UART_CHAR_FCR;
 		break;
@@ -121,7 +109,7 @@ static void uniphier_serial_out(struct uart_port *p, int offset, int value)
 		valshift = 8;
 		/* Divisor latch access bit does not exist. */
 		value &= ~UART_LCR_DLAB;
-		/* fall through */
+		fallthrough;
 	case UART_MCR:
 		offset = UNIPHIER_UART_LCR_MCR;
 		break;
@@ -157,50 +145,14 @@ static void uniphier_serial_out(struct uart_port *p, int offset, int value)
  * The divisor latch register exists at different address.
  * Override dl_read/write callbacks.
  */
-static int uniphier_serial_dl_read(struct uart_8250_port *up)
+static u32 uniphier_serial_dl_read(struct uart_8250_port *up)
 {
 	return readl(up->port.membase + UNIPHIER_UART_DLR);
 }
 
-static void uniphier_serial_dl_write(struct uart_8250_port *up, int value)
+static void uniphier_serial_dl_write(struct uart_8250_port *up, u32 value)
 {
 	writel(value, up->port.membase + UNIPHIER_UART_DLR);
-}
-
-static int uniphier_of_serial_setup(struct device *dev, struct uart_port *port,
-				    struct uniphier8250_priv *priv)
-{
-	int ret;
-	u32 prop;
-	struct device_node *np = dev->of_node;
-
-	ret = of_alias_get_id(np, "serial");
-	if (ret < 0) {
-		dev_err(dev, "failed to get alias id\n");
-		return ret;
-	}
-	port->line = ret;
-
-	/* Get clk rate through clk driver */
-	priv->clk = devm_clk_get(dev, NULL);
-	if (IS_ERR(priv->clk)) {
-		dev_err(dev, "failed to get clock\n");
-		return PTR_ERR(priv->clk);
-	}
-
-	ret = clk_prepare_enable(priv->clk);
-	if (ret < 0)
-		return ret;
-
-	port->uartclk = clk_get_rate(priv->clk);
-
-	/* Check for fifo size */
-	if (of_property_read_u32(np, "fifo-size", &prop) == 0)
-		port->fifosize = prop;
-	else
-		port->fifosize = UNIPHIER_UART_DEFAULT_FIFO_SIZE;
-
-	return 0;
 }
 
 static int uniphier_uart_probe(struct platform_device *pdev)
@@ -210,7 +162,6 @@ static int uniphier_uart_probe(struct platform_device *pdev)
 	struct uniphier8250_priv *priv;
 	struct resource *regs;
 	void __iomem *membase;
-	int irq;
 	int ret;
 
 	regs = platform_get_resource(pdev, IORESOURCE_MEM, 0);
@@ -223,21 +174,23 @@ static int uniphier_uart_probe(struct platform_device *pdev)
 	if (!membase)
 		return -ENOMEM;
 
-	irq = platform_get_irq(pdev, 0);
-	if (irq < 0) {
-		dev_err(dev, "failed to get IRQ number\n");
-		return irq;
-	}
-
 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
 
 	memset(&up, 0, sizeof(up));
 
-	ret = uniphier_of_serial_setup(dev, &up.port, priv);
-	if (ret < 0)
+	priv->clk = devm_clk_get(dev, NULL);
+	if (IS_ERR(priv->clk)) {
+		dev_err(dev, "failed to get clock\n");
+		return PTR_ERR(priv->clk);
+	}
+
+	ret = clk_prepare_enable(priv->clk);
+	if (ret)
 		return ret;
+
+	up.port.uartclk = clk_get_rate(priv->clk);
 
 	spin_lock_init(&priv->atomic_write_lock);
 
@@ -246,13 +199,20 @@ static int uniphier_uart_probe(struct platform_device *pdev)
 	up.port.mapbase = regs->start;
 	up.port.mapsize = resource_size(regs);
 	up.port.membase = membase;
-	up.port.irq = irq;
+
+	ret = uart_read_port_properties(&up.port);
+	if (ret)
+		return ret;
 
 	up.port.type = PORT_16550A;
 	up.port.iotype = UPIO_MEM32;
+	up.port.fifosize = 64;
 	up.port.regshift = UNIPHIER_UART_REGSHIFT;
 	up.port.flags = UPF_FIXED_PORT | UPF_FIXED_TYPE;
 	up.capabilities = UART_CAP_FIFO;
+
+	if (of_property_read_bool(dev->of_node, "auto-flow-control"))
+		up.capabilities |= UART_CAP_AFE;
 
 	up.port.serial_in = uniphier_serial_in;
 	up.port.serial_out = uniphier_serial_out;
@@ -272,14 +232,12 @@ static int uniphier_uart_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int uniphier_uart_remove(struct platform_device *pdev)
+static void uniphier_uart_remove(struct platform_device *pdev)
 {
 	struct uniphier8250_priv *priv = platform_get_drvdata(pdev);
 
 	serial8250_unregister_port(priv->line);
 	clk_disable_unprepare(priv->clk);
-
-	return 0;
 }
 
 static int __maybe_unused uniphier_uart_suspend(struct device *dev)
@@ -324,7 +282,7 @@ MODULE_DEVICE_TABLE(of, uniphier_uart_match);
 
 static struct platform_driver uniphier_uart_platform_driver = {
 	.probe		= uniphier_uart_probe,
-	.remove		= uniphier_uart_remove,
+	.remove_new	= uniphier_uart_remove,
 	.driver = {
 		.name	= "uniphier-uart",
 		.of_match_table = uniphier_uart_match,

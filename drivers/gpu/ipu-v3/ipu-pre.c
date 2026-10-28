@@ -1,18 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2017 Lucas Stach, Pengutronix
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
  */
 
 #include <drm/drm_fourcc.h>
 #include <linux/clk.h>
+#include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/genalloc.h>
 #include <linux/module.h>
@@ -49,6 +42,10 @@
 #define IPU_PRE_TPR_CTRL				0x070
 #define  IPU_PRE_TPR_CTRL_TILE_FORMAT(v)		((v & 0xff) << 0)
 #define  IPU_PRE_TPR_CTRL_TILE_FORMAT_MASK		0xff
+#define  IPU_PRE_TPR_CTRL_TILE_FORMAT_16_BIT		(1 << 0)
+#define  IPU_PRE_TPR_CTRL_TILE_FORMAT_SPLIT_BUF		(1 << 4)
+#define  IPU_PRE_TPR_CTRL_TILE_FORMAT_SINGLE_BUF	(1 << 5)
+#define  IPU_PRE_TPR_CTRL_TILE_FORMAT_SUPER_TILED	(1 << 6)
 
 #define IPU_PRE_PREFETCH_ENG_CTRL			0x080
 #define  IPU_PRE_PREF_ENG_CTRL_PREFETCH_EN		(1 << 0)
@@ -100,8 +97,16 @@ struct ipu_pre {
 
 	dma_addr_t		buffer_paddr;
 	void			*buffer_virt;
-	bool			in_use;
-	unsigned int		safe_window_end;
+
+	struct {
+		bool		in_use;
+		uint64_t	modifier;
+		unsigned int	height;
+		unsigned int	safe_window_end;
+		unsigned int	bufaddr;
+		u32		ctrl;
+		u8		cpp;
+	} cur;
 };
 
 static DEFINE_MUTEX(ipu_pre_list_mutex);
@@ -116,22 +121,20 @@ int ipu_pre_get_available_count(void)
 struct ipu_pre *
 ipu_pre_lookup_by_phandle(struct device *dev, const char *name, int index)
 {
-	struct device_node *pre_node = of_parse_phandle(dev->of_node,
-							name, index);
+	struct device_node *pre_node __free(device_node) =
+		of_parse_phandle(dev->of_node, name, index);
 	struct ipu_pre *pre;
 
 	mutex_lock(&ipu_pre_list_mutex);
 	list_for_each_entry(pre, &ipu_pre_list, list) {
 		if (pre_node == pre->dev->of_node) {
 			mutex_unlock(&ipu_pre_list_mutex);
-			device_link_add(dev, pre->dev, DL_FLAG_AUTOREMOVE);
-			of_node_put(pre_node);
+			device_link_add(dev, pre->dev,
+					DL_FLAG_AUTOREMOVE_CONSUMER);
 			return pre;
 		}
 	}
 	mutex_unlock(&ipu_pre_list_mutex);
-
-	of_node_put(pre_node);
 
 	return NULL;
 }
@@ -140,7 +143,7 @@ int ipu_pre_get(struct ipu_pre *pre)
 {
 	u32 val;
 
-	if (pre->in_use)
+	if (pre->cur.in_use)
 		return -EBUSY;
 
 	/* first get the engine out of reset and remove clock gating */
@@ -150,10 +153,10 @@ int ipu_pre_get(struct ipu_pre *pre)
 	val = IPU_PRE_CTRL_HANDSHAKE_ABORT_SKIP_EN |
 	      IPU_PRE_CTRL_HANDSHAKE_EN |
 	      IPU_PRE_CTRL_TPR_REST_SEL |
-	      IPU_PRE_CTRL_BLOCK_16 | IPU_PRE_CTRL_SDW_UPDATE;
+	      IPU_PRE_CTRL_SDW_UPDATE;
 	writel(val, pre->regs + IPU_PRE_CTRL);
 
-	pre->in_use = true;
+	pre->cur.in_use = true;
 	return 0;
 }
 
@@ -161,19 +164,58 @@ void ipu_pre_put(struct ipu_pre *pre)
 {
 	writel(IPU_PRE_CTRL_SFTRST, pre->regs + IPU_PRE_CTRL);
 
-	pre->in_use = false;
+	pre->cur.in_use = false;
+}
+
+static inline void
+ipu_pre_update_safe_window(struct ipu_pre *pre)
+{
+	if (pre->cur.modifier == DRM_FORMAT_MOD_LINEAR)
+		pre->cur.safe_window_end = pre->cur.height - 2;
+	else
+		pre->cur.safe_window_end = DIV_ROUND_UP(pre->cur.height, 4) - 1;
+}
+
+static void
+ipu_pre_configure_modifier(struct ipu_pre *pre, uint64_t modifier)
+{
+	u32 val;
+
+	val = readl(pre->regs + IPU_PRE_TPR_CTRL);
+	val &= ~IPU_PRE_TPR_CTRL_TILE_FORMAT_MASK;
+	if (modifier != DRM_FORMAT_MOD_LINEAR) {
+		/* only support single buffer formats for now */
+		val |= IPU_PRE_TPR_CTRL_TILE_FORMAT_SINGLE_BUF;
+		if (modifier == DRM_FORMAT_MOD_VIVANTE_SUPER_TILED)
+			val |= IPU_PRE_TPR_CTRL_TILE_FORMAT_SUPER_TILED;
+		if (pre->cur.cpp == 2)
+			val |= IPU_PRE_TPR_CTRL_TILE_FORMAT_16_BIT;
+	}
+	writel(val, pre->regs + IPU_PRE_TPR_CTRL);
+
+	if (modifier == DRM_FORMAT_MOD_LINEAR)
+		pre->cur.ctrl &= ~IPU_PRE_CTRL_BLOCK_EN;
+	else
+		pre->cur.ctrl |= IPU_PRE_CTRL_BLOCK_EN;
+
+	pre->cur.modifier = modifier;
 }
 
 void ipu_pre_configure(struct ipu_pre *pre, unsigned int width,
 		       unsigned int height, unsigned int stride, u32 format,
-		       unsigned int bufaddr)
+		       uint64_t modifier, unsigned int bufaddr)
 {
 	const struct drm_format_info *info = drm_format_info(format);
 	u32 active_bpp = info->cpp[0] >> 1;
 	u32 val;
 
+	pre->cur.bufaddr = bufaddr;
+	pre->cur.height = height;
+	pre->cur.cpp = info->cpp[0];
+	pre->cur.ctrl = readl(pre->regs + IPU_PRE_CTRL);
+
 	/* calculate safe window for ctrl register updates */
-	pre->safe_window_end = height - 2;
+	ipu_pre_update_safe_window(pre);
 
 	writel(bufaddr, pre->regs + IPU_PRE_CUR_BUF);
 	writel(bufaddr, pre->regs + IPU_PRE_NEXT_BUF);
@@ -206,22 +248,30 @@ void ipu_pre_configure(struct ipu_pre *pre, unsigned int width,
 
 	writel(pre->buffer_paddr, pre->regs + IPU_PRE_STORE_ENG_ADDR);
 
-	val = readl(pre->regs + IPU_PRE_CTRL);
-	val |= IPU_PRE_CTRL_EN_REPEAT | IPU_PRE_CTRL_ENABLE |
-	       IPU_PRE_CTRL_SDW_UPDATE;
-	writel(val, pre->regs + IPU_PRE_CTRL);
+	ipu_pre_configure_modifier(pre, modifier);
+
+	pre->cur.ctrl |= IPU_PRE_CTRL_EN_REPEAT | IPU_PRE_CTRL_ENABLE;
+	writel(pre->cur.ctrl | IPU_PRE_CTRL_SDW_UPDATE,
+	       pre->regs + IPU_PRE_CTRL);
 }
 
-void ipu_pre_update(struct ipu_pre *pre, unsigned int bufaddr)
+void ipu_pre_update(struct ipu_pre *pre, uint64_t modifier, unsigned int bufaddr)
 {
-	unsigned long timeout = jiffies + msecs_to_jiffies(5);
-	unsigned short current_yblock;
-	u32 val;
+	if (bufaddr == pre->cur.bufaddr &&
+	    modifier == pre->cur.modifier)
+		return;
 
 	writel(bufaddr, pre->regs + IPU_PRE_NEXT_BUF);
+	pre->cur.bufaddr = bufaddr;
 
-	do {
-		if (time_after(jiffies, timeout)) {
+	if (modifier != pre->cur.modifier)
+		ipu_pre_configure_modifier(pre, modifier);
+
+	for (int i = 0;; i++) {
+		unsigned short current_yblock;
+		u32 val;
+
+		if (i > 500) {
 			dev_warn(pre->dev, "timeout waiting for PRE safe window\n");
 			return;
 		}
@@ -230,9 +280,26 @@ void ipu_pre_update(struct ipu_pre *pre, unsigned int bufaddr)
 		current_yblock =
 			(val >> IPU_PRE_STORE_ENG_STATUS_STORE_BLOCK_Y_SHIFT) &
 			IPU_PRE_STORE_ENG_STATUS_STORE_BLOCK_Y_MASK;
-	} while (current_yblock == 0 || current_yblock >= pre->safe_window_end);
 
-	writel(IPU_PRE_CTRL_SDW_UPDATE, pre->regs + IPU_PRE_CTRL_SET);
+		if (current_yblock != 0 &&
+		    current_yblock < pre->cur.safe_window_end)
+			break;
+
+		udelay(10);
+		cpu_relax();
+	}
+
+	writel(pre->cur.ctrl | IPU_PRE_CTRL_SDW_UPDATE,
+	       pre->regs + IPU_PRE_CTRL);
+
+	/* calculate safe window for the next update with the new modifier */
+	ipu_pre_update_safe_window(pre);
+}
+
+bool ipu_pre_update_pending(struct ipu_pre *pre)
+{
+	return !!(readl_relaxed(pre->regs + IPU_PRE_CTRL) &
+		  IPU_PRE_CTRL_SDW_UPDATE);
 }
 
 u32 ipu_pre_get_baddr(struct ipu_pre *pre)
@@ -243,15 +310,13 @@ u32 ipu_pre_get_baddr(struct ipu_pre *pre)
 static int ipu_pre_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	struct resource *res;
 	struct ipu_pre *pre;
 
 	pre = devm_kzalloc(dev, sizeof(*pre), GFP_KERNEL);
 	if (!pre)
 		return -ENOMEM;
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	pre->regs = devm_ioremap_resource(&pdev->dev, res);
+	pre->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(pre->regs))
 		return PTR_ERR(pre->regs);
 
@@ -286,7 +351,7 @@ static int ipu_pre_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int ipu_pre_remove(struct platform_device *pdev)
+static void ipu_pre_remove(struct platform_device *pdev)
 {
 	struct ipu_pre *pre = platform_get_drvdata(pdev);
 
@@ -300,7 +365,6 @@ static int ipu_pre_remove(struct platform_device *pdev)
 	if (pre->buffer_virt)
 		gen_pool_free(pre->iram, (unsigned long)pre->buffer_virt,
 			      IPU_PRE_MAX_WIDTH * IPU_PRE_NUM_SCANLINES * 4);
-	return 0;
 }
 
 static const struct of_device_id ipu_pre_dt_ids[] = {
@@ -310,7 +374,7 @@ static const struct of_device_id ipu_pre_dt_ids[] = {
 
 struct platform_driver ipu_pre_drv = {
 	.probe		= ipu_pre_probe,
-	.remove		= ipu_pre_remove,
+	.remove_new	= ipu_pre_remove,
 	.driver		= {
 		.name	= "imx-ipu-pre",
 		.of_match_table = ipu_pre_dt_ids,

@@ -1,9 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * rsrc_iodyn.c -- Resource management routines for MEM-static sockets.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
  *
  * The initial developer of the original code is David A. Hinds
  * <dahinds@users.sourceforge.net>.  Portions created by David A. Hinds
@@ -64,6 +61,9 @@ static struct resource *__iodyn_find_io_region(struct pcmcia_socket *s,
 	struct pcmcia_align_data data;
 	unsigned long min = base;
 	int ret;
+
+	if (!res)
+		return NULL;
 
 	data.mask = align - 1;
 	data.offset = base & data.mask;

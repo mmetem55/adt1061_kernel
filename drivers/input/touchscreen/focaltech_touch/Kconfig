@@ -1,7 +1,0 @@
-config TOUCHSCREEN_FTS
-	tristate "Focaltech Touchscreen"
-	depends on I2C
-	default n
-	help
-	  Say Y here if you have Focaltech touch panel.
-	  If unsure, say N.

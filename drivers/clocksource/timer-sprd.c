@@ -207,24 +207,3 @@ static int __init sprd_suspend_timer_init(struct device_node *np)
 TIMER_OF_DECLARE(sc9860_timer, "sprd,sc9860-timer", sprd_timer_init);
 TIMER_OF_DECLARE(sc9860_persistent_timer, "sprd,sc9860-suspend-timer",
 		 sprd_suspend_timer_init);
-TIMER_OF_DECLARE(sharkl5_timer, "sprd,sharkl5-timer", sprd_timer_init);
-TIMER_OF_DECLARE(sharkl5_persistent_timer, "sprd,sharkl5-suspend-timer",
-		 sprd_suspend_timer_init);
-TIMER_OF_DECLARE(roc1_timer, "sprd,roc1-timer", sprd_timer_init);
-TIMER_OF_DECLARE(roc1_persistent_timer, "sprd,roc1-suspend-timer",
-		 sprd_suspend_timer_init);
-TIMER_OF_DECLARE(sharkl3_timer, "sprd,sharkl3-timer", sprd_timer_init);
-TIMER_OF_DECLARE(sharkl3_persistent_timer, "sprd,sharkl3-suspend-timer",
-		 sprd_suspend_timer_init);
-TIMER_OF_DECLARE(orca_timer, "sprd,orca-timer", sprd_timer_init);
-TIMER_OF_DECLARE(orca_persistent_timer, "sprd,orca-suspend-timer",
-		 sprd_suspend_timer_init);
-TIMER_OF_DECLARE(sharkle_timer, "sprd,sharkle-timer", sprd_timer_init);
-TIMER_OF_DECLARE(sharkle_persistent_timer, "sprd,sharkle-suspend-timer",
-		 sprd_suspend_timer_init);
-TIMER_OF_DECLARE(pike2_timer, "sprd,pike2-timer", sprd_timer_init);
-TIMER_OF_DECLARE(pike2_persistent_timer, "sprd,pike2-suspend-timer",
-		 sprd_suspend_timer_init);
-TIMER_OF_DECLARE(sharkl5Pro_timer, "sprd,sharkl5Pro-timer", sprd_timer_init);
-TIMER_OF_DECLARE(sharkl5Pro_persistent_timer, "sprd,sharkl5Pro-suspend-timer",
-		 sprd_suspend_timer_init);

@@ -1,12 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Mac80211 power management API for ST-Ericsson CW1200 drivers
  *
  * Copyright (c) 2011, ST-Ericsson
  * Author: Dmitry Tarnyagin <dmitry.tarnyagin@lockless.no>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
  */
 
 #include <linux/module.h>
@@ -91,7 +88,7 @@ struct cw1200_suspend_state {
 	u8 prev_ps_mode;
 };
 
-static void cw1200_pm_stay_awake_tmo(unsigned long arg)
+static void cw1200_pm_stay_awake_tmo(struct timer_list *unused)
 {
 	/* XXX what's the point of this ? */
 }
@@ -101,8 +98,7 @@ int cw1200_pm_init(struct cw1200_pm_state *pm,
 {
 	spin_lock_init(&pm->lock);
 
-	setup_timer(&pm->stay_awake, cw1200_pm_stay_awake_tmo,
-		    (unsigned long)pm);
+	timer_setup(&pm->stay_awake, cw1200_pm_stay_awake_tmo, 0);
 
 	return 0;
 }
@@ -268,12 +264,14 @@ int cw1200_wow_suspend(struct ieee80211_hw *hw, struct cfg80211_wowlan *wowlan)
 		wiphy_err(priv->hw->wiphy,
 			  "PM request failed: %d. WoW is disabled.\n", ret);
 		cw1200_wow_resume(hw);
+		mutex_unlock(&priv->conf_mutex);
 		return -EBUSY;
 	}
 
 	/* Force resume if event is coming from the device. */
 	if (atomic_read(&priv->bh_rx)) {
 		cw1200_wow_resume(hw);
+		mutex_unlock(&priv->conf_mutex);
 		return -EAGAIN;
 	}
 

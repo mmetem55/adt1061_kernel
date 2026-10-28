@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  *
  * general timer device for using in ISDN stacks
@@ -5,16 +6,6 @@
  * Author	Karsten Keil <kkeil@novell.com>
  *
  * Copyright 2008  by Karsten Keil <kkeil@novell.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
  */
 
 #include <linux/poll.h>
@@ -83,7 +74,7 @@ mISDN_close(struct inode *ino, struct file *filep)
 	while (!list_empty(list)) {
 		timer = list_first_entry(list, struct mISDNtimer, list);
 		spin_unlock_irq(&dev->lock);
-		del_timer_sync(&timer->tl);
+		timer_shutdown_sync(&timer->tl);
 		spin_lock_irq(&dev->lock);
 		/* it might have been moved to ->expired */
 		list_del(&timer->list);
@@ -118,14 +109,14 @@ mISDN_read(struct file *filep, char __user *buf, size_t count, loff_t *off)
 		spin_unlock_irq(&dev->lock);
 		if (filep->f_flags & O_NONBLOCK)
 			return -EAGAIN;
-		wait_event_interruptible(dev->wait, (dev->work ||
+		wait_event_interruptible(dev->wait, (READ_ONCE(dev->work) ||
 						     !list_empty(list)));
 		if (signal_pending(current))
 			return -ERESTARTSYS;
 		spin_lock_irq(&dev->lock);
 	}
 	if (dev->work)
-		dev->work = 0;
+		WRITE_ONCE(dev->work, 0);
 	if (!list_empty(list)) {
 		timer = list_first_entry(list, struct mISDNtimer, list);
 		list_del(&timer->list);
@@ -141,30 +132,33 @@ mISDN_read(struct file *filep, char __user *buf, size_t count, loff_t *off)
 	return ret;
 }
 
-static unsigned int
+static __poll_t
 mISDN_poll(struct file *filep, poll_table *wait)
 {
 	struct mISDNtimerdev	*dev = filep->private_data;
-	unsigned int		mask = POLLERR;
+	__poll_t		mask = EPOLLERR;
 
 	if (*debug & DEBUG_TIMER)
 		printk(KERN_DEBUG "%s(%p, %p)\n", __func__, filep, wait);
 	if (dev) {
+		u32 work;
+
 		poll_wait(filep, &dev->wait, wait);
 		mask = 0;
-		if (dev->work || !list_empty(&dev->expired))
-			mask |= (POLLIN | POLLRDNORM);
+		work = READ_ONCE(dev->work);
+		if (work || !list_empty(&dev->expired))
+			mask |= (EPOLLIN | EPOLLRDNORM);
 		if (*debug & DEBUG_TIMER)
 			printk(KERN_DEBUG "%s work(%d) empty(%d)\n", __func__,
-			       dev->work, list_empty(&dev->expired));
+			       work, list_empty(&dev->expired));
 	}
 	return mask;
 }
 
 static void
-dev_expire_timer(unsigned long data)
+dev_expire_timer(struct timer_list *t)
 {
-	struct mISDNtimer *timer = (void *)data;
+	struct mISDNtimer *timer = from_timer(timer, t, tl);
 	u_long			flags;
 
 	spin_lock_irqsave(&timer->dev->lock, flags);
@@ -181,7 +175,7 @@ misdn_add_timer(struct mISDNtimerdev *dev, int timeout)
 	struct mISDNtimer	*timer;
 
 	if (!timeout) {
-		dev->work = 1;
+		WRITE_ONCE(dev->work, 1);
 		wake_up_interruptible(&dev->wait);
 		id = 0;
 	} else {
@@ -189,7 +183,7 @@ misdn_add_timer(struct mISDNtimerdev *dev, int timeout)
 		if (!timer)
 			return -ENOMEM;
 		timer->dev = dev;
-		setup_timer(&timer->tl, dev_expire_timer, (long)timer);
+		timer_setup(&timer->tl, dev_expire_timer, 0);
 		spin_lock_irq(&dev->lock);
 		id = timer->id = dev->next_id++;
 		if (dev->next_id < 0)
@@ -213,7 +207,7 @@ misdn_del_timer(struct mISDNtimerdev *dev, int id)
 			list_del_init(&timer->list);
 			timer->id = -1;
 			spin_unlock_irq(&dev->lock);
-			del_timer_sync(&timer->tl);
+			timer_shutdown_sync(&timer->tl);
 			kfree(timer);
 			return id;
 		}
@@ -275,7 +269,6 @@ static const struct file_operations mISDN_fops = {
 	.unlocked_ioctl	= mISDN_ioctl,
 	.open		= mISDN_open,
 	.release	= mISDN_close,
-	.llseek		= no_llseek,
 };
 
 static struct miscdevice mISDNtimer = {

@@ -1,75 +1,30 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * AArch64 loadable module support.
  *
  * Copyright (C) 2012 ARM Limited
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
  * Author: Will Deacon <will.deacon@arm.com>
  */
 
+#define pr_fmt(fmt) "Modules: " fmt
+
 #include <linux/bitops.h>
 #include <linux/elf.h>
-#include <linux/gfp.h>
+#include <linux/ftrace.h>
 #include <linux/kasan.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <linux/moduleloader.h>
-#include <linux/vmalloc.h>
+#include <linux/random.h>
+#include <linux/scs.h>
+
 #include <asm/alternative.h>
 #include <asm/insn.h>
+#include <asm/kvm_hyptrace.h>
+#include <asm/kvm_hypevents_defs.h>
+#include <asm/scs.h>
 #include <asm/sections.h>
-
-void *module_alloc(unsigned long size)
-{
-	u64 module_alloc_end = module_alloc_base + MODULES_VSIZE;
-	gfp_t gfp_mask = GFP_KERNEL;
-	void *p;
-
-	/* Silence the initial allocation */
-	if (IS_ENABLED(CONFIG_ARM64_MODULE_PLTS))
-		gfp_mask |= __GFP_NOWARN;
-
-	if (IS_ENABLED(CONFIG_KASAN))
-		/* don't exceed the static module region - see below */
-		module_alloc_end = MODULES_END;
-
-	p = __vmalloc_node_range(size, MODULE_ALIGN, module_alloc_base,
-				module_alloc_end, gfp_mask, PAGE_KERNEL_EXEC, 0,
-				NUMA_NO_NODE, __builtin_return_address(0));
-
-	if (!p && IS_ENABLED(CONFIG_ARM64_MODULE_PLTS) &&
-	    !IS_ENABLED(CONFIG_KASAN))
-		/*
-		 * KASAN can only deal with module allocations being served
-		 * from the reserved module region, since the remainder of
-		 * the vmalloc region is already backed by zero shadow pages,
-		 * and punching holes into it is non-trivial. Since the module
-		 * region is not randomized when KASAN is enabled, it is even
-		 * less likely that the module region gets exhausted, so we
-		 * can simply omit this fallback in that case.
-		 */
-		p = __vmalloc_node_range(size, MODULE_ALIGN, VMALLOC_START,
-				VMALLOC_END, GFP_KERNEL, PAGE_KERNEL_EXEC, 0,
-				NUMA_NO_NODE, __builtin_return_address(0));
-
-	if (p && (kasan_module_alloc(p, size) < 0)) {
-		vfree(p);
-		return NULL;
-	}
-
-	return p;
-}
 
 enum aarch64_reloc_op {
 	RELOC_OP_NONE,
@@ -99,16 +54,50 @@ static int reloc_data(enum aarch64_reloc_op op, void *place, u64 val, int len)
 {
 	s64 sval = do_reloc(op, place, val);
 
+	/*
+	 * The ELF psABI for AArch64 documents the 16-bit and 32-bit place
+	 * relative and absolute relocations as having a range of [-2^15, 2^16)
+	 * or [-2^31, 2^32), respectively. However, in order to be able to
+	 * detect overflows reliably, we have to choose whether we interpret
+	 * such quantities as signed or as unsigned, and stick with it.
+	 * The way we organize our address space requires a signed
+	 * interpretation of 32-bit relative references, so let's use that
+	 * for all R_AARCH64_PRELxx relocations. This means our upper
+	 * bound for overflow detection should be Sxx_MAX rather than Uxx_MAX.
+	 */
+
 	switch (len) {
 	case 16:
 		*(s16 *)place = sval;
-		if (sval < S16_MIN || sval > U16_MAX)
-			return -ERANGE;
+		switch (op) {
+		case RELOC_OP_ABS:
+			if (sval < 0 || sval > U16_MAX)
+				return -ERANGE;
+			break;
+		case RELOC_OP_PREL:
+			if (sval < S16_MIN || sval > S16_MAX)
+				return -ERANGE;
+			break;
+		default:
+			pr_err("Invalid 16-bit data relocation (%d)\n", op);
+			return 0;
+		}
 		break;
 	case 32:
 		*(s32 *)place = sval;
-		if (sval < S32_MIN || sval > U32_MAX)
-			return -ERANGE;
+		switch (op) {
+		case RELOC_OP_ABS:
+			if (sval < 0 || sval > U32_MAX)
+				return -ERANGE;
+			break;
+		case RELOC_OP_PREL:
+			if (sval < S32_MIN || sval > S32_MAX)
+				return -ERANGE;
+			break;
+		default:
+			pr_err("Invalid 32-bit data relocation (%d)\n", op);
+			return 0;
+		}
 		break;
 	case 64:
 		*(s64 *)place = sval;
@@ -201,6 +190,33 @@ static int reloc_insn_imm(enum aarch64_reloc_op op, __le32 *place, u64 val,
 	return 0;
 }
 
+static int reloc_insn_adrp(struct module *mod, Elf64_Shdr *sechdrs,
+			   __le32 *place, u64 val)
+{
+	u32 insn;
+
+	if (!is_forbidden_offset_for_adrp(place))
+		return reloc_insn_imm(RELOC_OP_PAGE, place, val, 12, 21,
+				      AARCH64_INSN_IMM_ADR);
+
+	/* patch ADRP to ADR if it is in range */
+	if (!reloc_insn_imm(RELOC_OP_PREL, place, val & ~0xfff, 0, 21,
+			    AARCH64_INSN_IMM_ADR)) {
+		insn = le32_to_cpu(*place);
+		insn &= ~BIT(31);
+	} else {
+		/* out of range for ADR -> emit a veneer */
+		val = module_emit_veneer_for_adrp(mod, sechdrs, place, val & ~0xfff);
+		if (!val)
+			return -ENOEXEC;
+		insn = aarch64_insn_gen_branch_imm((u64)place, val,
+						   AARCH64_INSN_BRANCH_NOLINK);
+	}
+
+	*place = cpu_to_le32(insn);
+	return 0;
+}
+
 int apply_relocate_add(Elf64_Shdr *sechdrs,
 		       const char *strtab,
 		       unsigned int symindex,
@@ -263,18 +279,21 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
 		/* MOVW instruction relocations. */
 		case R_AARCH64_MOVW_UABS_G0_NC:
 			overflow_check = false;
+			fallthrough;
 		case R_AARCH64_MOVW_UABS_G0:
 			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 0,
 					      AARCH64_INSN_IMM_MOVKZ);
 			break;
 		case R_AARCH64_MOVW_UABS_G1_NC:
 			overflow_check = false;
+			fallthrough;
 		case R_AARCH64_MOVW_UABS_G1:
 			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 16,
 					      AARCH64_INSN_IMM_MOVKZ);
 			break;
 		case R_AARCH64_MOVW_UABS_G2_NC:
 			overflow_check = false;
+			fallthrough;
 		case R_AARCH64_MOVW_UABS_G2:
 			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 32,
 					      AARCH64_INSN_IMM_MOVKZ);
@@ -340,14 +359,14 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
 			ovf = reloc_insn_imm(RELOC_OP_PREL, loc, val, 0, 21,
 					     AARCH64_INSN_IMM_ADR);
 			break;
-#ifndef CONFIG_ARM64_ERRATUM_843419
 		case R_AARCH64_ADR_PREL_PG_HI21_NC:
 			overflow_check = false;
+			fallthrough;
 		case R_AARCH64_ADR_PREL_PG_HI21:
-			ovf = reloc_insn_imm(RELOC_OP_PAGE, loc, val, 12, 21,
-					     AARCH64_INSN_IMM_ADR);
+			ovf = reloc_insn_adrp(me, sechdrs, loc, val);
+			if (ovf && ovf != -ERANGE)
+				return ovf;
 			break;
-#endif
 		case R_AARCH64_ADD_ABS_LO12_NC:
 		case R_AARCH64_LDST8_ABS_LO12_NC:
 			overflow_check = false;
@@ -386,10 +405,10 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
 		case R_AARCH64_CALL26:
 			ovf = reloc_insn_imm(RELOC_OP_PREL, loc, val, 2, 26,
 					     AARCH64_INSN_IMM_26);
-
-			if (IS_ENABLED(CONFIG_ARM64_MODULE_PLTS) &&
-			    ovf == -ERANGE) {
-				val = module_emit_plt_entry(me, loc, &rel[i], sym);
+			if (ovf == -ERANGE) {
+				val = module_emit_plt_entry(me, sechdrs, loc, &rel[i], sym);
+				if (!val)
+					return -ENOEXEC;
 				ovf = reloc_insn_imm(RELOC_OP_PREL, loc, val, 2,
 						     26, AARCH64_INSN_IMM_26);
 			}
@@ -414,23 +433,219 @@ overflow:
 	return -ENOEXEC;
 }
 
+static inline void __init_plt(struct plt_entry *plt, unsigned long addr)
+{
+	*plt = get_plt_entry(addr, plt);
+}
+
+static int module_init_ftrace_plt(const Elf_Ehdr *hdr,
+				  const Elf_Shdr *sechdrs,
+				  struct module *mod)
+{
+#if defined(CONFIG_DYNAMIC_FTRACE)
+	const Elf_Shdr *s;
+	struct plt_entry *plts;
+
+	s = find_section(hdr, sechdrs, ".text.ftrace_trampoline");
+	if (!s)
+		return -ENOEXEC;
+
+	plts = (void *)s->sh_addr;
+
+	__init_plt(&plts[FTRACE_PLT_IDX], FTRACE_ADDR);
+
+	mod->arch.ftrace_trampolines = plts;
+#endif
+	return 0;
+}
+
+#ifdef CONFIG_KVM
+static const Elf_Shdr *find_symbol_table(const Elf_Ehdr *hdr,
+					 const Elf_Shdr *sechdrs)
+{
+	int idx;
+
+	for (idx = 1; idx < hdr->e_shnum; idx++) {
+		if (sechdrs[idx].sh_type == SHT_SYMTAB)
+			return &sechdrs[idx];
+	}
+
+	return NULL;
+}
+
+static int
+module_init_hyp_imported_sym(const Elf_Ehdr *hdr, const Elf_Shdr *sechdrs,
+			     struct module *mod)
+{
+	struct pkvm_el2_module *hyp_mod = &mod->arch.hyp;
+	struct pkvm_el2_sym *pkvm_sym;
+	const Elf_Shdr *symtab = NULL, *s, *se, *orig;
+	const char *strtab = NULL;
+	const Elf_Rela *rela;
+	const Elf_Sym *sym;
+
+	INIT_LIST_HEAD(&hyp_mod->ext_symbols);
+
+	for (s = sechdrs, se = sechdrs + hdr->e_shnum; s < se; s++) {
+		if (s->sh_type != SHT_RELA)
+			continue;
+
+		/* Imported symbols only used in .hyp.text */
+		orig = &sechdrs[s->sh_info];
+		if ((void *)orig->sh_addr != hyp_mod->text.start)
+			continue;
+
+		for (rela = (Elf_Rela *)((void *)hdr + s->sh_offset);
+		     rela < (Elf_Rela *)((void *)hdr + s->sh_offset + s->sh_size); rela++) {
+			size_t len;
+
+			symtab = symtab ? symtab : find_symbol_table(hdr, sechdrs);
+			if (!symtab)
+				return -ENOEXEC;
+			strtab = (const char *)hdr + sechdrs[symtab->sh_link].sh_offset;
+
+			sym = (Elf_Sym *)((const char *)hdr + symtab->sh_offset) +
+				ELF64_R_SYM(rela->r_info);
+
+			/* Imported symbols are UNDEF */
+			if (sym->st_shndx != SHN_UNDEF)
+				continue;
+
+			if (ELF64_R_TYPE(rela->r_info) != R_AARCH64_CALL26) {
+				pr_warn("Unknown relocation type for imported symbol %s\n",
+					strtab + sym->st_name);
+				return -EINVAL;
+			}
+
+			pkvm_sym = kmalloc(sizeof(*pkvm_sym), GFP_KERNEL);
+			if (!pkvm_sym)
+				return -ENOMEM;
+
+			len = strlen(strtab + sym->st_name) + 1;
+			pkvm_sym->name = kzalloc(len, GFP_KERNEL);
+			strscpy(pkvm_sym->name, strtab + sym->st_name, len);
+			pkvm_sym->rela_pos = (void *)orig->sh_addr + rela->r_offset;
+
+			list_add(&pkvm_sym->node, &hyp_mod->ext_symbols);
+		}
+	}
+
+	return 0;
+}
+#endif
+
+static int module_init_hyp(const Elf_Ehdr *hdr, const Elf_Shdr *sechdrs,
+			   struct module *mod)
+{
+#ifdef CONFIG_KVM
+	struct pkvm_el2_module *hyp_mod = &mod->arch.hyp;
+	const Elf_Shdr *s;
+
+	/*
+	 * If the .hyp.text is missing or empty, this is not a hypervisor
+	 * module so ignore the rest of it.
+	 */
+	s = find_section(hdr, sechdrs, ".hyp.text");
+	if (!s || !s->sh_size)
+		return 0;
+
+	hyp_mod->text = (struct pkvm_module_section) {
+		.start	= (void *)s->sh_addr,
+		.end	= (void *)s->sh_addr + s->sh_size,
+	};
+
+	module_init_hyp_imported_sym(hdr, sechdrs, mod);
+
+	s = find_section(hdr, sechdrs, ".hyp.reloc");
+	if (!s)
+		return -ENOEXEC;
+
+	mod->arch.hyp.relocs = (void *)s->sh_addr;
+	mod->arch.hyp.nr_relocs = s->sh_size / sizeof(*mod->arch.hyp.relocs);
+
+	s = find_section(hdr, sechdrs, ".hyp.bss");
+	if (s && s->sh_size) {
+		mod->arch.hyp.bss = (struct pkvm_module_section) {
+			.start	= (void *)s->sh_addr,
+			.end	= (void *)s->sh_addr + s->sh_size,
+		};
+	}
+
+	s = find_section(hdr, sechdrs, ".hyp.rodata");
+	if (s && s->sh_size) {
+		mod->arch.hyp.rodata = (struct pkvm_module_section) {
+			.start	= (void *)s->sh_addr,
+			.end	= (void *)s->sh_addr + s->sh_size,
+		};
+	}
+
+	s = find_section(hdr, sechdrs, ".hyp.data");
+	if (s && s->sh_size) {
+		mod->arch.hyp.data = (struct pkvm_module_section) {
+			.start	= (void *)s->sh_addr,
+			.end	= (void *)s->sh_addr + s->sh_size,
+		};
+	}
+
+	s = find_section(hdr, sechdrs, ".hyp.event_ids");
+	if (s && s->sh_size) {
+		mod->arch.hyp.event_ids = (struct pkvm_module_section) {
+			.start	= (void *)s->sh_addr,
+			.end	= (void *)s->sh_addr + s->sh_size,
+		};
+	}
+
+	s = find_section(hdr, sechdrs, "_hyp_events");
+	if (s && s->sh_size) {
+		if (!mod->arch.hyp.event_ids.start) {
+			WARN(1, "%s: Did you forget define_events.h in the EL2 (hyp) code?",
+			     mod->name);
+		} else {
+			hyp_mod->hyp_events = (void *)s->sh_addr;
+			hyp_mod->nr_hyp_events = s->sh_size /
+				sizeof(*hyp_mod->hyp_events);
+		}
+	}
+
+	s = find_section(hdr, sechdrs, ".hyp.printk_fmts");
+	if (s && s->sh_size) {
+		hyp_mod->hyp_printk_fmts = (void *)s->sh_addr;
+		hyp_mod->nr_hyp_printk_fmts = s->sh_size /
+			sizeof(*hyp_mod->hyp_printk_fmts);
+	}
+
+	s = find_section(hdr, sechdrs, ".hyp.patchable_function_entries");
+	if (s && s->sh_size) {
+		hyp_mod->patchable_function_entries = (struct pkvm_module_section) {
+			.start	= (void *)s->sh_addr,
+			.end	= (void *)s->sh_addr + s->sh_size,
+		};
+	}
+
+#endif
+	return 0;
+}
+
 int module_finalize(const Elf_Ehdr *hdr,
 		    const Elf_Shdr *sechdrs,
 		    struct module *me)
 {
-	const Elf_Shdr *s, *se;
-	const char *secstrs = (void *)hdr + sechdrs[hdr->e_shstrndx].sh_offset;
+	int err;
+	const Elf_Shdr *s;
 
-	for (s = sechdrs, se = sechdrs + hdr->e_shnum; s < se; s++) {
-		if (strcmp(".altinstructions", secstrs + s->sh_name) == 0) {
-			apply_alternatives((void *)s->sh_addr, s->sh_size);
-		}
-#ifdef CONFIG_ARM64_MODULE_PLTS
-		if (IS_ENABLED(CONFIG_DYNAMIC_FTRACE) &&
-		    !strcmp(".text.ftrace_trampoline", secstrs + s->sh_name))
-			me->arch.ftrace_trampoline = (void *)s->sh_addr;
-#endif
+	s = find_section(hdr, sechdrs, ".altinstructions");
+	if (s)
+		apply_alternatives_module((void *)s->sh_addr, s->sh_size);
+
+	if (scs_is_dynamic()) {
+		s = find_section(hdr, sechdrs, ".init.eh_frame");
+		if (s)
+			__pi_scs_patch((void *)s->sh_addr, s->sh_size);
 	}
 
-	return 0;
+	err = module_init_ftrace_plt(hdr, sechdrs, me);
+	if (err)
+		return err;
+
+	return module_init_hyp(hdr, sechdrs, me);
 }

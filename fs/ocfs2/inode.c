@@ -1,26 +1,10 @@
-/* -*- mode: c; c-basic-offset: 8; -*-
- * vim: noexpandtab sw=8 ts=8 sts=0:
- *
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
  * inode.c
  *
  * vfs' aops, fops, dops and iops
  *
  * Copyright (C) 2002, 2004 Oracle.  All rights reserved.
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public
- * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public
- * License along with this program; if not, write to the
- * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
- * Boston, MA 021110-1307, USA.
  */
 
 #include <linux/fs.h>
@@ -28,6 +12,7 @@
 #include <linux/highmem.h>
 #include <linux/pagemap.h>
 #include <linux/quotaops.h>
+#include <linux/iversion.h>
 
 #include <asm/byteorder.h>
 
@@ -140,7 +125,7 @@ struct inode *ocfs2_iget(struct ocfs2_super *osb, u64 blkno, unsigned flags,
 	struct inode *inode = NULL;
 	struct super_block *sb = osb->sb;
 	struct ocfs2_find_inode_args args;
-	journal_t *journal = OCFS2_SB(sb)->journal->j_journal;
+	journal_t *journal = osb->journal->j_journal;
 
 	trace_ocfs2_iget_begin((unsigned long long)blkno, flags,
 			       sysfile_type);
@@ -302,7 +287,7 @@ void ocfs2_populate_inode(struct inode *inode, struct ocfs2_dinode *fe,
 	OCFS2_I(inode)->ip_attr = le32_to_cpu(fe->i_attr);
 	OCFS2_I(inode)->ip_dyn_features = le16_to_cpu(fe->i_dyn_features);
 
-	inode->i_version = 1;
+	inode_set_iversion(inode, 1);
 	inode->i_generation = le32_to_cpu(fe->i_generation);
 	inode->i_rdev = huge_decode_dev(le64_to_cpu(fe->id1.dev1.i_rdev));
 	inode->i_mode = le16_to_cpu(fe->i_mode);
@@ -317,12 +302,12 @@ void ocfs2_populate_inode(struct inode *inode, struct ocfs2_dinode *fe,
 		inode->i_blocks = ocfs2_inode_sector_count(inode);
 		inode->i_mapping->a_ops = &ocfs2_aops;
 	}
-	inode->i_atime.tv_sec = le64_to_cpu(fe->i_atime);
-	inode->i_atime.tv_nsec = le32_to_cpu(fe->i_atime_nsec);
-	inode->i_mtime.tv_sec = le64_to_cpu(fe->i_mtime);
-	inode->i_mtime.tv_nsec = le32_to_cpu(fe->i_mtime_nsec);
-	inode->i_ctime.tv_sec = le64_to_cpu(fe->i_ctime);
-	inode->i_ctime.tv_nsec = le32_to_cpu(fe->i_ctime_nsec);
+	inode_set_atime(inode, le64_to_cpu(fe->i_atime),
+		        le32_to_cpu(fe->i_atime_nsec));
+	inode_set_mtime(inode, le64_to_cpu(fe->i_mtime),
+		        le32_to_cpu(fe->i_mtime_nsec));
+	inode_set_ctime(inode, le64_to_cpu(fe->i_ctime),
+		        le32_to_cpu(fe->i_ctime_nsec));
 
 	if (OCFS2_I(inode)->ip_blkno != le64_to_cpu(fe->i_blkno))
 		mlog(ML_ERROR,
@@ -547,7 +532,7 @@ static int ocfs2_read_locked_inode(struct inode *inode,
 	 */
 	mlog_bug_on_msg(!!(fe->i_flags & cpu_to_le32(OCFS2_SYSTEM_FL)) !=
 			!!(args->fi_flags & OCFS2_FI_FLAG_SYSFILE),
-			"Inode %llu: system file state is ambigous\n",
+			"Inode %llu: system file state is ambiguous\n",
 			(unsigned long long)args->fi_blkno);
 
 	if (S_ISCHR(le16_to_cpu(fe->i_mode)) ||
@@ -636,10 +621,8 @@ static int ocfs2_truncate_for_delete(struct ocfs2_super *osb,
 		handle = NULL;
 
 		status = ocfs2_commit_truncate(osb, inode, fe_bh);
-		if (status < 0) {
+		if (status < 0)
 			mlog_errno(status);
-			goto out;
-		}
 	}
 
 out:
@@ -730,7 +713,7 @@ bail:
 /*
  * Serialize with orphan dir recovery. If the process doing
  * recovery on this orphan dir does an iget() with the dir
- * i_mutex held, we'll deadlock here. Instead we detect this
+ * i_rwsem held, we'll deadlock here. Instead we detect this
  * and exit early - recovery will wipe this inode for us.
  */
 static int ocfs2_check_orphan_recovery_state(struct ocfs2_super *osb,
@@ -1134,7 +1117,7 @@ static void ocfs2_clear_inode(struct inode *inode)
 	trace_ocfs2_clear_inode((unsigned long long)oi->ip_blkno,
 				inode->i_nlink);
 
-	mlog_bug_on_msg(OCFS2_SB(inode->i_sb) == NULL,
+	mlog_bug_on_msg(osb == NULL,
 			"Inode=%lu\n", inode->i_ino);
 
 	dquot_drop(inode);
@@ -1149,7 +1132,7 @@ static void ocfs2_clear_inode(struct inode *inode)
 	ocfs2_mark_lockres_freeing(osb, &oi->ip_inode_lockres);
 	ocfs2_mark_lockres_freeing(osb, &oi->ip_open_lockres);
 
-	ocfs2_resv_discard(&OCFS2_SB(inode->i_sb)->osb_la_resmap,
+	ocfs2_resv_discard(&osb->osb_la_resmap,
 			   &oi->ip_la_data_resv);
 	ocfs2_resv_init_once(&oi->ip_la_data_resv);
 
@@ -1159,7 +1142,7 @@ static void ocfs2_clear_inode(struct inode *inode)
 	 * exception here are successfully wiped inodes - their
 	 * metadata can now be considered to be part of the system
 	 * inodes from which it came. */
-	if (!(OCFS2_I(inode)->ip_flags & OCFS2_INODE_DELETED))
+	if (!(oi->ip_flags & OCFS2_INODE_DELETED))
 		ocfs2_checkpoint_inode(inode);
 
 	mlog_bug_on_msg(!list_empty(&oi->ip_io_markers),
@@ -1222,7 +1205,10 @@ static void ocfs2_clear_inode(struct inode *inode)
 	 * the journal is flushed before journal shutdown. Thus it is safe to
 	 * have inodes get cleaned up after journal shutdown.
 	 */
-	jbd2_journal_release_jbd_inode(OCFS2_SB(inode->i_sb)->journal->j_journal,
+	if (!osb->journal)
+		return;
+
+	jbd2_journal_release_jbd_inode(osb->journal->j_journal,
 				       &oi->ip_jinode);
 }
 
@@ -1329,12 +1315,12 @@ int ocfs2_mark_inode_dirty(handle_t *handle,
 	fe->i_uid = cpu_to_le32(i_uid_read(inode));
 	fe->i_gid = cpu_to_le32(i_gid_read(inode));
 	fe->i_mode = cpu_to_le16(inode->i_mode);
-	fe->i_atime = cpu_to_le64(inode->i_atime.tv_sec);
-	fe->i_atime_nsec = cpu_to_le32(inode->i_atime.tv_nsec);
-	fe->i_ctime = cpu_to_le64(inode->i_ctime.tv_sec);
-	fe->i_ctime_nsec = cpu_to_le32(inode->i_ctime.tv_nsec);
-	fe->i_mtime = cpu_to_le64(inode->i_mtime.tv_sec);
-	fe->i_mtime_nsec = cpu_to_le32(inode->i_mtime.tv_nsec);
+	fe->i_atime = cpu_to_le64(inode_get_atime_sec(inode));
+	fe->i_atime_nsec = cpu_to_le32(inode_get_atime_nsec(inode));
+	fe->i_ctime = cpu_to_le64(inode_get_ctime_sec(inode));
+	fe->i_ctime_nsec = cpu_to_le32(inode_get_ctime_nsec(inode));
+	fe->i_mtime = cpu_to_le64(inode_get_mtime_sec(inode));
+	fe->i_mtime_nsec = cpu_to_le32(inode_get_mtime_nsec(inode));
 
 	ocfs2_journal_dirty(handle, bh);
 	ocfs2_update_inode_fsync_trans(handle, inode, 1);
@@ -1365,12 +1351,12 @@ void ocfs2_refresh_inode(struct inode *inode,
 		inode->i_blocks = 0;
 	else
 		inode->i_blocks = ocfs2_inode_sector_count(inode);
-	inode->i_atime.tv_sec = le64_to_cpu(fe->i_atime);
-	inode->i_atime.tv_nsec = le32_to_cpu(fe->i_atime_nsec);
-	inode->i_mtime.tv_sec = le64_to_cpu(fe->i_mtime);
-	inode->i_mtime.tv_nsec = le32_to_cpu(fe->i_mtime_nsec);
-	inode->i_ctime.tv_sec = le64_to_cpu(fe->i_ctime);
-	inode->i_ctime.tv_nsec = le32_to_cpu(fe->i_ctime_nsec);
+	inode_set_atime(inode, le64_to_cpu(fe->i_atime),
+			le32_to_cpu(fe->i_atime_nsec));
+	inode_set_mtime(inode, le64_to_cpu(fe->i_mtime),
+			le32_to_cpu(fe->i_mtime_nsec));
+	inode_set_ctime(inode, le64_to_cpu(fe->i_ctime),
+			le32_to_cpu(fe->i_ctime_nsec));
 
 	spin_unlock(&OCFS2_I(inode)->ip_lock);
 }
@@ -1431,6 +1417,37 @@ int ocfs2_validate_inode_block(struct super_block *sb,
 				 (unsigned long long)bh->b_blocknr,
 				 le32_to_cpu(di->i_fs_generation));
 		goto bail;
+	}
+
+	if (le16_to_cpu(di->i_dyn_features) & OCFS2_INLINE_DATA_FL) {
+		struct ocfs2_inline_data *data = &di->id2.i_data;
+
+		if (le32_to_cpu(di->i_clusters)) {
+			rc = ocfs2_error(sb,
+					 "Invalid dinode %llu: %u clusters\n",
+					 (unsigned long long)bh->b_blocknr,
+					 le32_to_cpu(di->i_clusters));
+			goto bail;
+		}
+
+		if (le16_to_cpu(data->id_count) >
+		    ocfs2_max_inline_data_with_xattr(sb, di)) {
+			rc = ocfs2_error(sb,
+					 "Invalid dinode #%llu: inline data id_count %u exceeds max %d\n",
+					 (unsigned long long)bh->b_blocknr,
+					 le16_to_cpu(data->id_count),
+					 ocfs2_max_inline_data_with_xattr(sb, di));
+			goto bail;
+		}
+
+		if (le64_to_cpu(di->i_size) > le16_to_cpu(data->id_count)) {
+			rc = ocfs2_error(sb,
+					 "Invalid dinode #%llu: inline data i_size %llu exceeds id_count %u\n",
+					 (unsigned long long)bh->b_blocknr,
+					 (unsigned long long)le64_to_cpu(di->i_size),
+					 le16_to_cpu(data->id_count));
+			goto bail;
+		}
 	}
 
 	rc = 0;
@@ -1498,7 +1515,6 @@ static int ocfs2_filecheck_validate_inode_block(struct super_block *sb,
 		     (unsigned long long)bh->b_blocknr,
 		     le32_to_cpu(di->i_fs_generation));
 		rc = -OCFS2_FILECHECK_ERR_GENERATION;
-		goto bail;
 	}
 
 bail:
@@ -1639,6 +1655,7 @@ static struct super_block *ocfs2_inode_cache_get_super(struct ocfs2_caching_info
 }
 
 static void ocfs2_inode_cache_lock(struct ocfs2_caching_info *ci)
+__acquires(&oi->ip_lock)
 {
 	struct ocfs2_inode_info *oi = cache_info_to_inode(ci);
 
@@ -1646,6 +1663,7 @@ static void ocfs2_inode_cache_lock(struct ocfs2_caching_info *ci)
 }
 
 static void ocfs2_inode_cache_unlock(struct ocfs2_caching_info *ci)
+__releases(&oi->ip_lock)
 {
 	struct ocfs2_inode_info *oi = cache_info_to_inode(ci);
 

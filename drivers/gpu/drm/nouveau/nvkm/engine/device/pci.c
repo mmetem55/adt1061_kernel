@@ -1574,6 +1574,12 @@ nvkm_device_pci_resource_size(struct nvkm_device *device, unsigned bar)
 	return pci_resource_len(pdev->pdev, bar);
 }
 
+static int
+nvkm_device_pci_irq(struct nvkm_device *device)
+{
+	return nvkm_device_pci(device)->pdev->irq;
+}
+
 static void
 nvkm_device_pci_fini(struct nvkm_device *device, bool suspend)
 {
@@ -1612,6 +1618,7 @@ nvkm_device_pci_func = {
 	.dtor = nvkm_device_pci_dtor,
 	.preinit = nvkm_device_pci_preinit,
 	.fini = nvkm_device_pci_fini,
+	.irq = nvkm_device_pci_irq,
 	.resource_addr = nvkm_device_pci_resource_addr,
 	.resource_size = nvkm_device_pci_resource_size,
 	.cpu_coherent = !IS_ENABLED(CONFIG_ARM),
@@ -1619,7 +1626,6 @@ nvkm_device_pci_func = {
 
 int
 nvkm_device_pci_new(struct pci_dev *pci_dev, const char *cfg, const char *dbg,
-		    bool detect, bool mmio, u64 subdev_mask,
 		    struct nvkm_device **pdevice)
 {
 	const struct nvkm_device_quirk *quirk = NULL;
@@ -1627,7 +1633,7 @@ nvkm_device_pci_new(struct pci_dev *pci_dev, const char *cfg, const char *dbg,
 	const struct nvkm_device_pci_vendor *pciv;
 	const char *name = NULL;
 	struct nvkm_device_pci *pdev;
-	int ret;
+	int ret, bits;
 
 	ret = pci_enable_device(pci_dev);
 	if (ret)
@@ -1673,23 +1679,22 @@ nvkm_device_pci_new(struct pci_dev *pci_dev, const char *cfg, const char *dbg,
 				    pci_dev->bus->number << 16 |
 				    PCI_SLOT(pci_dev->devfn) << 8 |
 				    PCI_FUNC(pci_dev->devfn), name,
-			       cfg, dbg, detect, mmio, subdev_mask,
-			       &pdev->device);
+			       cfg, dbg, &pdev->device);
 
 	if (ret)
 		return ret;
 
-	/*
-	 * Set a preliminary DMA mask based on the .dma_bits member of the
-	 * MMU subdevice. This allows other subdevices to create DMA mappings
-	 * in their init() or oneinit() methods, which may be called before the
-	 * TTM layer sets the DMA mask definitively.
-	 * This is necessary for platforms where the default DMA mask of 32
-	 * does not cover any system memory, i.e., when all RAM is > 4 GB.
-	 */
-	if (pdev->device.mmu)
-		dma_set_mask_and_coherent(&pci_dev->dev,
-				DMA_BIT_MASK(pdev->device.mmu->dma_bits));
+	/* Set DMA mask based on capabilities reported by the MMU subdev. */
+	if (pdev->device.mmu && !pdev->device.pci->agp.bridge)
+		bits = pdev->device.mmu->dma_bits;
+	else
+		bits = 32;
+
+	ret = dma_set_mask_and_coherent(&pci_dev->dev, DMA_BIT_MASK(bits));
+	if (ret && bits != 32) {
+		dma_set_mask_and_coherent(&pci_dev->dev, DMA_BIT_MASK(32));
+		pdev->device.mmu->dma_bits = 32;
+	}
 
 	return 0;
 }

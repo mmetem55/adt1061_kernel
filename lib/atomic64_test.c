@@ -1,12 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Testsuite for atomic64_t functions
  *
  * Copyright © 2010  Luca Barbieri
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -277,4 +273,5 @@ static __exit void test_atomics_exit(void) {}
 module_init(test_atomics_init);
 module_exit(test_atomics_exit);
 
+MODULE_DESCRIPTION("Testsuite for atomic64_t functions");
 MODULE_LICENSE("GPL");

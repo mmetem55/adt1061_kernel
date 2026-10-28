@@ -1,18 +1,10 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * Hardware spinlock public header
  *
  * Copyright (C) 2010 Texas Instruments Incorporated - http://www.ti.com
  *
  * Contact: Ohad Ben-Cohen <ohad@wizery.com>
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License version 2 as published
- * by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
  */
 
 #ifndef __LINUX_HWSPINLOCK_H
@@ -22,9 +14,10 @@
 #include <linux/sched.h>
 
 /* hwspinlock mode argument */
-#define HWLOCK_IRQSTATE	0x01	/* Disable interrupts, save state */
-#define HWLOCK_IRQ	0x02	/* Disable interrupts, don't save state */
-#define HWLOCK_RAW	0x03
+#define HWLOCK_IRQSTATE		0x01 /* Disable interrupts, save state */
+#define HWLOCK_IRQ		0x02 /* Disable interrupts, don't save state */
+#define HWLOCK_RAW		0x03
+#define HWLOCK_IN_ATOMIC	0x04 /* Called while in atomic context */
 
 struct device;
 struct device_node;
@@ -75,6 +68,7 @@ int __hwspin_lock_timeout(struct hwspinlock *, unsigned int, int,
 int __hwspin_trylock(struct hwspinlock *, int, unsigned long *);
 void __hwspin_unlock(struct hwspinlock *, int, unsigned long *);
 int of_hwspin_lock_get_id_byname(struct device_node *np, const char *name);
+int hwspin_lock_bust(struct hwspinlock *hwlock, unsigned int id);
 int devm_hwspin_lock_free(struct device *dev, struct hwspinlock *hwlock);
 struct hwspinlock *devm_hwspin_lock_request(struct device *dev);
 struct hwspinlock *devm_hwspin_lock_request_specific(struct device *dev,
@@ -132,6 +126,11 @@ int __hwspin_trylock(struct hwspinlock *hwlock, int mode, unsigned long *flags)
 static inline
 void __hwspin_unlock(struct hwspinlock *hwlock, int mode, unsigned long *flags)
 {
+}
+
+static inline int hwspin_lock_bust(struct hwspinlock *hwlock, unsigned int id)
+{
+	return 0;
 }
 
 static inline int of_hwspin_lock_get_id(struct device_node *np, int index)
@@ -231,6 +230,23 @@ static inline int hwspin_trylock_raw(struct hwspinlock *hwlock)
 }
 
 /**
+ * hwspin_trylock_in_atomic() - attempt to lock a specific hwspinlock
+ * @hwlock: an hwspinlock which we want to trylock
+ *
+ * This function attempts to lock an hwspinlock, and will immediately fail
+ * if the hwspinlock is already taken.
+ *
+ * This function shall be called only from an atomic context.
+ *
+ * Returns 0 if we successfully locked the hwspinlock, -EBUSY if
+ * the hwspinlock was already taken, and -EINVAL if @hwlock is invalid.
+ */
+static inline int hwspin_trylock_in_atomic(struct hwspinlock *hwlock)
+{
+	return __hwspin_trylock(hwlock, HWLOCK_IN_ATOMIC, NULL);
+}
+
+/**
  * hwspin_trylock() - attempt to lock a specific hwspinlock
  * @hwlock: an hwspinlock which we want to trylock
  *
@@ -321,6 +337,28 @@ int hwspin_lock_timeout_raw(struct hwspinlock *hwlock, unsigned int to)
 }
 
 /**
+ * hwspin_lock_timeout_in_atomic() - lock an hwspinlock with timeout limit
+ * @hwlock: the hwspinlock to be locked
+ * @to: timeout value in msecs
+ *
+ * This function locks the underlying @hwlock. If the @hwlock
+ * is already taken, the function will busy loop waiting for it to
+ * be released, but give up when @timeout msecs have elapsed.
+ *
+ * This function shall be called only from an atomic context and the timeout
+ * value shall not exceed a few msecs.
+ *
+ * Returns 0 when the @hwlock was successfully taken, and an appropriate
+ * error code otherwise (most notably an -ETIMEDOUT if the @hwlock is still
+ * busy after @timeout msecs). The function will never sleep.
+ */
+static inline
+int hwspin_lock_timeout_in_atomic(struct hwspinlock *hwlock, unsigned int to)
+{
+	return __hwspin_lock_timeout(hwlock, to, HWLOCK_IN_ATOMIC, NULL);
+}
+
+/**
  * hwspin_lock_timeout() - lock an hwspinlock with timeout limit
  * @hwlock: the hwspinlock to be locked
  * @to: timeout value in msecs
@@ -392,6 +430,21 @@ static inline void hwspin_unlock_irq(struct hwspinlock *hwlock)
 static inline void hwspin_unlock_raw(struct hwspinlock *hwlock)
 {
 	__hwspin_unlock(hwlock, HWLOCK_RAW, NULL);
+}
+
+/**
+ * hwspin_unlock_in_atomic() - unlock hwspinlock
+ * @hwlock: a previously-acquired hwspinlock which we want to unlock
+ *
+ * This function will unlock a specific hwspinlock.
+ *
+ * @hwlock must be already locked (e.g. by hwspin_trylock()) before calling
+ * this function: it is a bug to call unlock on a @hwlock that is already
+ * unlocked.
+ */
+static inline void hwspin_unlock_in_atomic(struct hwspinlock *hwlock)
+{
+	__hwspin_unlock(hwlock, HWLOCK_IN_ATOMIC, NULL);
 }
 
 /**

@@ -1,13 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *  net/dccp/minisocks.c
  *
  *  An implementation of the DCCP protocol
  *  Arnaldo Carvalho de Melo <acme@conectiva.com.br>
- *
- *	This program is free software; you can redistribute it and/or
- *	modify it under the terms of the GNU General Public License
- *	as published by the Free Software Foundation; either version
- *	2 of the License, or (at your option) any later version.
  */
 
 #include <linux/dccp.h>
@@ -19,6 +15,7 @@
 #include <net/sock.h>
 #include <net/xfrm.h>
 #include <net/inet_timewait_sock.h>
+#include <net/rstreason.h>
 
 #include "ackvec.h"
 #include "ccid.h"
@@ -26,6 +23,7 @@
 #include "feat.h"
 
 struct inet_timewait_death_row dccp_death_row = {
+	.tw_refcount = REFCOUNT_INIT(1),
 	.sysctl_max_tw_buckets = NR_FILE * 2,
 	.hashinfo	= &dccp_hashinfo,
 };
@@ -53,20 +51,13 @@ void dccp_time_wait(struct sock *sk, int state, int timeo)
 		if (timeo < rto)
 			timeo = rto;
 
-		tw->tw_timeout = DCCP_TIMEWAIT_LEN;
 		if (state == DCCP_TIME_WAIT)
 			timeo = DCCP_TIMEWAIT_LEN;
 
-		/* tw_timer is pinned, so we need to make sure BH are disabled
-		 * in following section, otherwise timer handler could run before
-		 * we complete the initialization.
+		/* Linkage updates.
+		 * Note that access to tw after this point is illegal.
 		 */
-		local_bh_disable();
-		inet_twsk_schedule(tw, timeo);
-		/* Linkage updates. */
-		__inet_twsk_hashdance(tw, sk, &dccp_hashinfo);
-		inet_twsk_put(tw);
-		local_bh_enable();
+		inet_twsk_hashdance_schedule(tw, sk, &dccp_hashinfo, timeo);
 	} else {
 		/* Sorry, if we're out of memory, just CLOSE this
 		 * socket up.  We've got bigger problems than
@@ -98,6 +89,8 @@ struct sock *dccp_create_openreq_child(const struct sock *sk,
 		newdp->dccps_role	    = DCCP_ROLE_SERVER;
 		newdp->dccps_hc_rx_ackvec   = NULL;
 		newdp->dccps_service_list   = NULL;
+		newdp->dccps_hc_rx_ccid     = NULL;
+		newdp->dccps_hc_tx_ccid     = NULL;
 		newdp->dccps_service	    = dreq->dreq_service;
 		newdp->dccps_timestamp_echo = dreq->dreq_timestamp_echo;
 		newdp->dccps_timestamp_time = dreq->dreq_timestamp_time;
@@ -203,7 +196,7 @@ struct sock *dccp_check_req(struct sock *sk, struct sk_buff *skb,
 	DCCP_SKB_CB(skb)->dccpd_reset_code = DCCP_RESET_CODE_TOO_BUSY;
 drop:
 	if (dccp_hdr(skb)->dccph_type != DCCP_PKT_RESET)
-		req->rsk_ops->send_reset(sk, skb);
+		req->rsk_ops->send_reset(sk, skb, SK_RST_REASON_NOT_SPECIFIED);
 
 	inet_csk_reqsk_queue_drop(sk, req);
 out:
@@ -220,6 +213,7 @@ EXPORT_SYMBOL_GPL(dccp_check_req);
  */
 int dccp_child_process(struct sock *parent, struct sock *child,
 		       struct sk_buff *skb)
+	__releases(child)
 {
 	int ret = 0;
 	const int state = child->sk_state;

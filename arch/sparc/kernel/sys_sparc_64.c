@@ -28,8 +28,9 @@
 #include <linux/random.h>
 #include <linux/export.h>
 #include <linux/context_tracking.h>
-
+#include <linux/timex.h>
 #include <linux/uaccess.h>
+
 #include <asm/utrap.h>
 #include <asm/unistd.h>
 
@@ -39,7 +40,7 @@
 
 /* #define DEBUG_UNIMP_SYSCALL */
 
-asmlinkage unsigned long sys_getpagesize(void)
+SYSCALL_DEFINE0(getpagesize)
 {
 	return PAGE_SIZE;
 }
@@ -86,13 +87,13 @@ static inline unsigned long COLOR_ALIGN(unsigned long addr,
 	return base + off;
 }
 
-unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr, unsigned long len, unsigned long pgoff, unsigned long flags)
+unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr, unsigned long len, unsigned long pgoff, unsigned long flags, vm_flags_t vm_flags)
 {
 	struct mm_struct *mm = current->mm;
 	struct vm_area_struct * vma;
 	unsigned long task_size = TASK_SIZE;
 	int do_color_align;
-	struct vm_unmapped_area_info info;
+	struct vm_unmapped_area_info info = {};
 
 	if (flags & MAP_FIXED) {
 		/* We do not accept a shared mapping if it would violate
@@ -125,7 +126,6 @@ unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr, unsi
 			return addr;
 	}
 
-	info.flags = 0;
 	info.length = len;
 	info.low_limit = TASK_UNMAPPED_BASE;
 	info.high_limit = min(task_size, VA_EXCLUDE_START);
@@ -146,14 +146,14 @@ unsigned long arch_get_unmapped_area(struct file *filp, unsigned long addr, unsi
 unsigned long
 arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
 			  const unsigned long len, const unsigned long pgoff,
-			  const unsigned long flags)
+			  const unsigned long flags, vm_flags_t vm_flags)
 {
 	struct vm_area_struct *vma;
 	struct mm_struct *mm = current->mm;
 	unsigned long task_size = STACK_TOP32;
 	unsigned long addr = addr0;
 	int do_color_align;
-	struct vm_unmapped_area_info info;
+	struct vm_unmapped_area_info info = {};
 
 	/* This should only ever run for 32-bit processes.  */
 	BUG_ON(!test_thread_flag(TIF_32BIT));
@@ -217,14 +217,10 @@ arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
 unsigned long get_fb_unmapped_area(struct file *filp, unsigned long orig_addr, unsigned long len, unsigned long pgoff, unsigned long flags)
 {
 	unsigned long align_goal, addr = -ENOMEM;
-	unsigned long (*get_area)(struct file *, unsigned long,
-				  unsigned long, unsigned long, unsigned long);
-
-	get_area = current->mm->get_unmapped_area;
 
 	if (flags & MAP_FIXED) {
 		/* Ok, don't mess with it. */
-		return get_area(NULL, orig_addr, len, pgoff, flags);
+		return mm_get_unmapped_area(current->mm, NULL, orig_addr, len, pgoff, flags);
 	}
 	flags &= ~MAP_SHARED;
 
@@ -237,7 +233,8 @@ unsigned long get_fb_unmapped_area(struct file *filp, unsigned long orig_addr, u
 		align_goal = (64UL * 1024);
 
 	do {
-		addr = get_area(NULL, orig_addr, len + (align_goal - PAGE_SIZE), pgoff, flags);
+		addr = mm_get_unmapped_area(current->mm, NULL, orig_addr,
+					    len + (align_goal - PAGE_SIZE), pgoff, flags);
 		if (!(addr & ~PAGE_MASK)) {
 			addr = (addr + (align_goal - 1UL)) & ~(align_goal - 1UL);
 			break;
@@ -255,7 +252,7 @@ unsigned long get_fb_unmapped_area(struct file *filp, unsigned long orig_addr, u
 	 * be obtained.
 	 */
 	if (addr & ~PAGE_MASK)
-		addr = get_area(NULL, orig_addr, len, pgoff, flags);
+		addr = mm_get_unmapped_area(current->mm, NULL, orig_addr, len, pgoff, flags);
 
 	return addr;
 }
@@ -276,7 +273,7 @@ static unsigned long mmap_rnd(void)
 	return rnd << PAGE_SHIFT;
 }
 
-void arch_pick_mmap_layout(struct mm_struct *mm)
+void arch_pick_mmap_layout(struct mm_struct *mm, struct rlimit *rlim_stack)
 {
 	unsigned long random_factor = mmap_rnd();
 	unsigned long gap;
@@ -285,13 +282,13 @@ void arch_pick_mmap_layout(struct mm_struct *mm)
 	 * Fall back to the standard layout if the personality
 	 * bit is set, or if the expected stack growth is unlimited:
 	 */
-	gap = rlimit(RLIMIT_STACK);
+	gap = rlim_stack->rlim_cur;
 	if (!test_thread_flag(TIF_32BIT) ||
 	    (current->personality & ADDR_COMPAT_LAYOUT) ||
 	    gap == RLIM_INFINITY ||
 	    sysctl_legacy_va_layout) {
 		mm->mmap_base = TASK_UNMAPPED_BASE + random_factor;
-		mm->get_unmapped_area = arch_get_unmapped_area;
+		clear_bit(MMF_TOPDOWN, &mm->flags);
 	} else {
 		/* We know it's 32-bit */
 		unsigned long task_size = STACK_TOP32;
@@ -302,7 +299,7 @@ void arch_pick_mmap_layout(struct mm_struct *mm)
 			gap = (task_size / 6 * 5);
 
 		mm->mmap_base = PAGE_ALIGN(task_size - gap - random_factor);
-		mm->get_unmapped_area = arch_get_unmapped_area_topdown;
+		set_bit(MMF_TOPDOWN, &mm->flags);
 	}
 }
 
@@ -310,7 +307,7 @@ void arch_pick_mmap_layout(struct mm_struct *mm)
  * sys_pipe() is the normal C calling standard for creating
  * a pipe. It's not the way unix traditionally does this, though.
  */
-SYSCALL_DEFINE1(sparc_pipe_real, struct pt_regs *, regs)
+SYSCALL_DEFINE0(sparc_pipe)
 {
 	int fd[2];
 	int error;
@@ -318,7 +315,7 @@ SYSCALL_DEFINE1(sparc_pipe_real, struct pt_regs *, regs)
 	error = do_pipe_flags(fd, 0);
 	if (error)
 		goto out;
-	regs->u_regs[UREG_I1] = fd[1];
+	current_pt_regs()->u_regs[UREG_I1] = fd[1];
 	error = fd[0];
 out:
 	return error;
@@ -335,25 +332,28 @@ SYSCALL_DEFINE6(sparc_ipc, unsigned int, call, int, first, unsigned long, second
 {
 	long err;
 
+	if (!IS_ENABLED(CONFIG_SYSVIPC))
+		return -ENOSYS;
+
 	/* No need for backward compatibility. We can start fresh... */
 	if (call <= SEMTIMEDOP) {
 		switch (call) {
 		case SEMOP:
-			err = sys_semtimedop(first, ptr,
-					     (unsigned int)second, NULL);
+			err = ksys_semtimedop(first, ptr,
+					      (unsigned int)second, NULL);
 			goto out;
 		case SEMTIMEDOP:
-			err = sys_semtimedop(first, ptr, (unsigned int)second,
-				(const struct timespec __user *)
-					     (unsigned long) fifth);
+			err = ksys_semtimedop(first, ptr, (unsigned int)second,
+				(const struct __kernel_timespec __user *)
+					      (unsigned long) fifth);
 			goto out;
 		case SEMGET:
-			err = sys_semget(first, (int)second, (int)third);
+			err = ksys_semget(first, (int)second, (int)third);
 			goto out;
 		case SEMCTL: {
-			err = sys_semctl(first, second,
-					 (int)third | IPC_64,
-					 (unsigned long) ptr);
+			err = ksys_old_semctl(first, second,
+					      (int)third | IPC_64,
+					      (unsigned long) ptr);
 			goto out;
 		}
 		default:
@@ -364,18 +364,18 @@ SYSCALL_DEFINE6(sparc_ipc, unsigned int, call, int, first, unsigned long, second
 	if (call <= MSGCTL) {
 		switch (call) {
 		case MSGSND:
-			err = sys_msgsnd(first, ptr, (size_t)second,
+			err = ksys_msgsnd(first, ptr, (size_t)second,
 					 (int)third);
 			goto out;
 		case MSGRCV:
-			err = sys_msgrcv(first, ptr, (size_t)second, fifth,
+			err = ksys_msgrcv(first, ptr, (size_t)second, fifth,
 					 (int)third);
 			goto out;
 		case MSGGET:
-			err = sys_msgget((key_t)first, (int)second);
+			err = ksys_msgget((key_t)first, (int)second);
 			goto out;
 		case MSGCTL:
-			err = sys_msgctl(first, (int)second | IPC_64, ptr);
+			err = ksys_old_msgctl(first, (int)second | IPC_64, ptr);
 			goto out;
 		default:
 			err = -ENOSYS;
@@ -395,13 +395,13 @@ SYSCALL_DEFINE6(sparc_ipc, unsigned int, call, int, first, unsigned long, second
 			goto out;
 		}
 		case SHMDT:
-			err = sys_shmdt(ptr);
+			err = ksys_shmdt(ptr);
 			goto out;
 		case SHMGET:
-			err = sys_shmget(first, (size_t)second, (int)third);
+			err = ksys_shmget(first, (size_t)second, (int)third);
 			goto out;
 		case SHMCTL:
-			err = sys_shmctl(first, (int)second | IPC_64, ptr);
+			err = ksys_old_shmctl(first, (int)second | IPC_64, ptr);
 			goto out;
 		default:
 			err = -ENOSYS;
@@ -458,7 +458,7 @@ SYSCALL_DEFINE6(mmap, unsigned long, addr, unsigned long, len,
 		goto out;
 	if (off & ~PAGE_MASK)
 		goto out;
-	retval = sys_mmap_pgoff(addr, len, prot, flags, fd, off >> PAGE_SHIFT);
+	retval = ksys_mmap_pgoff(addr, len, prot, flags, fd, off >> PAGE_SHIFT);
 out:
 	return retval;
 }
@@ -480,10 +480,10 @@ SYSCALL_DEFINE5(64_mremap, unsigned long, addr,	unsigned long, old_len,
 	return sys_mremap(addr, old_len, new_len, flags, new_addr);
 }
 
-/* we come to here via sys_nis_syscall so it can setup the regs argument */
-asmlinkage unsigned long c_sys_nis_syscall(struct pt_regs *regs)
+SYSCALL_DEFINE0(nis_syscall)
 {
 	static int count;
+	struct pt_regs *regs = current_pt_regs();
 	
 	/* Don't make the system unusable, if someone goes stuck */
 	if (count++ > 5)
@@ -502,7 +502,6 @@ asmlinkage unsigned long c_sys_nis_syscall(struct pt_regs *regs)
 asmlinkage void sparc_breakpoint(struct pt_regs *regs)
 {
 	enum ctx_state prev_state = exception_enter();
-	siginfo_t info;
 
 	if (test_thread_flag(TIF_32BIT)) {
 		regs->tpc &= 0xffffffff;
@@ -511,19 +510,12 @@ asmlinkage void sparc_breakpoint(struct pt_regs *regs)
 #ifdef DEBUG_SPARC_BREAKPOINT
         printk ("TRAP: Entering kernel PC=%lx, nPC=%lx\n", regs->tpc, regs->tnpc);
 #endif
-	info.si_signo = SIGTRAP;
-	info.si_errno = 0;
-	info.si_code = TRAP_BRKPT;
-	info.si_addr = (void __user *)regs->tpc;
-	info.si_trapno = 0;
-	force_sig_info(SIGTRAP, &info, current);
+	force_sig_fault(SIGTRAP, TRAP_BRKPT, (void __user *)regs->tpc);
 #ifdef DEBUG_SPARC_BREAKPOINT
 	printk ("TRAP: Returning to space: PC=%lx nPC=%lx\n", regs->tpc, regs->tnpc);
 #endif
 	exception_exit(prev_state);
 }
-
-extern void check_pending(int signum);
 
 SYSCALL_DEFINE2(getdomainname, char __user *, name, int, len)
 {
@@ -552,6 +544,63 @@ out_unlock:
 	return err;
 }
 
+SYSCALL_DEFINE1(sparc_adjtimex, struct __kernel_timex __user *, txc_p)
+{
+	struct __kernel_timex txc;
+	struct __kernel_old_timeval *tv = (void *)&txc.time;
+	int ret;
+
+	/* Copy the user data space into the kernel copy
+	 * structure. But bear in mind that the structures
+	 * may change
+	 */
+	if (copy_from_user(&txc, txc_p, sizeof(txc)))
+		return -EFAULT;
+
+	/*
+	 * override for sparc64 specific timeval type: tv_usec
+	 * is 32 bit wide instead of 64-bit in __kernel_timex
+	 */
+	txc.time.tv_usec = tv->tv_usec;
+	ret = do_adjtimex(&txc);
+	tv->tv_usec = txc.time.tv_usec;
+
+	return copy_to_user(txc_p, &txc, sizeof(txc)) ? -EFAULT : ret;
+}
+
+SYSCALL_DEFINE2(sparc_clock_adjtime, const clockid_t, which_clock,
+		struct __kernel_timex __user *, txc_p)
+{
+	struct __kernel_timex txc;
+	struct __kernel_old_timeval *tv = (void *)&txc.time;
+	int ret;
+
+	if (!IS_ENABLED(CONFIG_POSIX_TIMERS)) {
+		pr_err_once("process %d (%s) attempted a POSIX timer syscall "
+		    "while CONFIG_POSIX_TIMERS is not set\n",
+		    current->pid, current->comm);
+
+		return -ENOSYS;
+	}
+
+	/* Copy the user data space into the kernel copy
+	 * structure. But bear in mind that the structures
+	 * may change
+	 */
+	if (copy_from_user(&txc, txc_p, sizeof(txc)))
+		return -EFAULT;
+
+	/*
+	 * override for sparc64 specific timeval type: tv_usec
+	 * is 32 bit wide instead of 64-bit in __kernel_timex
+	 */
+	txc.time.tv_usec = tv->tv_usec;
+	ret = do_clock_adjtime(which_clock, &txc);
+	tv->tv_usec = txc.time.tv_usec;
+
+	return copy_to_user(txc_p, &txc, sizeof(txc)) ? -EFAULT : ret;
+}
+
 SYSCALL_DEFINE5(utrap_install, utrap_entry_t, type,
 		utrap_handler_t, new_p, utrap_handler_t, new_d,
 		utrap_handler_t __user *, old_p,
@@ -577,7 +626,8 @@ SYSCALL_DEFINE5(utrap_install, utrap_entry_t, type,
 	}
 	if (!current_thread_info()->utraps) {
 		current_thread_info()->utraps =
-			kzalloc((UT_TRAP_INSTRUCTION_31+1)*sizeof(long), GFP_KERNEL);
+			kcalloc(UT_TRAP_INSTRUCTION_31 + 1, sizeof(long),
+				GFP_KERNEL);
 		if (!current_thread_info()->utraps)
 			return -ENOMEM;
 		current_thread_info()->utraps[0] = 1;
@@ -587,8 +637,9 @@ SYSCALL_DEFINE5(utrap_install, utrap_entry_t, type,
 			unsigned long *p = current_thread_info()->utraps;
 
 			current_thread_info()->utraps =
-				kmalloc((UT_TRAP_INSTRUCTION_31+1)*sizeof(long),
-					GFP_KERNEL);
+				kmalloc_array(UT_TRAP_INSTRUCTION_31 + 1,
+					      sizeof(long),
+					      GFP_KERNEL);
 			if (!current_thread_info()->utraps) {
 				current_thread_info()->utraps = p;
 				return -ENOMEM;
@@ -612,9 +663,9 @@ SYSCALL_DEFINE5(utrap_install, utrap_entry_t, type,
 	return 0;
 }
 
-asmlinkage long sparc_memory_ordering(unsigned long model,
-				      struct pt_regs *regs)
+SYSCALL_DEFINE1(memory_ordering, unsigned long, model)
 {
+	struct pt_regs *regs = current_pt_regs();
 	if (model >= 3)
 		return -EINVAL;
 	regs->tstate = (regs->tstate & ~TSTATE_MM) | (model << 14);
@@ -648,7 +699,7 @@ SYSCALL_DEFINE5(rt_sigaction, int, sig, const struct sigaction __user *, act,
 	return ret;
 }
 
-asmlinkage long sys_kern_features(void)
+SYSCALL_DEFINE0(kern_features)
 {
 	return KERN_FEATURE_MIXED_MODE_STACK;
 }

@@ -1,19 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * OF NUMA Parsing support.
  *
  * Copyright (C) 2015 - 2016 Cavium Inc.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #define pr_fmt(fmt) "OF: NUMA: " fmt
@@ -21,6 +10,7 @@
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/nodemask.h>
+#include <linux/numa_memblks.h>
 
 #include <asm/numa.h>
 
@@ -35,18 +25,9 @@ static void __init of_numa_parse_cpu_nodes(void)
 {
 	u32 nid;
 	int r;
-	struct device_node *cpus;
-	struct device_node *np = NULL;
+	struct device_node *np;
 
-	cpus = of_find_node_by_path("/cpus");
-	if (!cpus)
-		return;
-
-	for_each_child_of_node(cpus, np) {
-		/* Skip things that are not CPUs */
-		if (of_node_cmp(np->type, "cpu") != 0)
-			continue;
-
+	for_each_of_cpu_node(np) {
 		r = of_property_read_u32(np, "numa-node-id", &nid);
 		if (r)
 			continue;
@@ -57,8 +38,6 @@ static void __init of_numa_parse_cpu_nodes(void)
 		else
 			node_set(nid, numa_nodes_parsed);
 	}
-
-	of_node_put(cpus);
 }
 
 static int __init of_numa_parse_memory_nodes(void)
@@ -66,7 +45,7 @@ static int __init of_numa_parse_memory_nodes(void)
 	struct device_node *np = NULL;
 	struct resource rsrc;
 	u32 nid;
-	int i, r;
+	int i, r = -EINVAL;
 
 	for_each_node_by_type(np, "memory") {
 		r = of_property_read_u32(np, "numa-node-id", &nid);
@@ -83,8 +62,11 @@ static int __init of_numa_parse_memory_nodes(void)
 			r = -EINVAL;
 		}
 
-		for (i = 0; !r && !of_address_to_resource(np, i, &rsrc); i++)
+		for (i = 0; !r && !of_address_to_resource(np, i, &rsrc); i++) {
 			r = numa_add_memblk(nid, rsrc.start, rsrc.end + 1);
+			if (!r)
+				node_set(nid, numa_nodes_parsed);
+		}
 
 		if (!i || r) {
 			of_node_put(np);
@@ -93,7 +75,7 @@ static int __init of_numa_parse_memory_nodes(void)
 		}
 	}
 
-	return 0;
+	return r;
 }
 
 static int __init of_numa_parse_distance_map_v1(struct device_node *map)
@@ -132,6 +114,8 @@ static int __init of_numa_parse_distance_map_v1(struct device_node *map)
 			       nodea, nodeb, distance);
 			return -EINVAL;
 		}
+
+		node_set(nodea, numa_nodes_parsed);
 
 		numa_set_distance(nodea, nodeb, distance);
 
@@ -179,8 +163,8 @@ int of_node_to_nid(struct device_node *device)
 		np = of_get_next_parent(np);
 	}
 	if (np && r)
-		pr_warn("Invalid \"numa-node-id\" property in node %s\n",
-			np->name);
+		pr_warn("Invalid \"numa-node-id\" property in node %pOFn\n",
+			np);
 	of_node_put(np);
 
 	/*
@@ -193,7 +177,6 @@ int of_node_to_nid(struct device_node *device)
 
 	return NUMA_NO_NODE;
 }
-EXPORT_SYMBOL(of_node_to_nid);
 
 int __init of_numa_init(void)
 {

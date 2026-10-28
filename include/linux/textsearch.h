@@ -23,7 +23,7 @@ struct ts_config;
 struct ts_state
 {
 	unsigned int		offset;
-	char			cb[40];
+	char			cb[48];
 };
 
 /**
@@ -35,6 +35,7 @@ struct ts_state
  * @get_pattern: return head of pattern
  * @get_pattern_len: return length of pattern
  * @owner: module reference to algorithm
+ * @list: list to search
  */
 struct ts_ops
 {
@@ -62,7 +63,7 @@ struct ts_config
 	int 			flags;
 
 	/**
-	 * get_next_block - fetch next block of data
+	 * @get_next_block: fetch next block of data
 	 * @consumed: number of bytes consumed by the caller
 	 * @dst: destination buffer
 	 * @conf: search configuration
@@ -79,7 +80,7 @@ struct ts_config
 						  struct ts_state *state);
 
 	/**
-	 * finish - finalize/clean a series of get_next_block() calls
+	 * @finish: finalize/clean a series of get_next_block() calls
 	 * @conf: search configuration
 	 * @state: search state
 	 *

@@ -1,19 +1,11 @@
-/**
+// SPDX-License-Identifier: GPL-2.0
+/*
  * dwc3-omap.c - OMAP Specific Glue layer
  *
- * Copyright (C) 2010-2011 Texas Instruments Incorporated - http://www.ti.com
+ * Copyright (C) 2010-2011 Texas Instruments Incorporated - https://www.ti.com
  *
  * Authors: Felipe Balbi <balbi@ti.com>,
  *	    Sebastian Andrzej Siewior <bigeasy@linutronix.de>
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2  of
- * the License as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
  */
 
 #include <linux/module.h>
@@ -22,7 +14,6 @@
 #include <linux/irq.h>
 #include <linux/interrupt.h>
 #include <linux/platform_device.h>
-#include <linux/platform_data/dwc3-omap.h>
 #include <linux/pm_runtime.h>
 #include <linux/dma-mapping.h>
 #include <linux/ioport.h>
@@ -113,6 +104,12 @@
 #define USBOTGSS_UTMI_OTG_CTRL_SESSEND		BIT(3)
 #define USBOTGSS_UTMI_OTG_CTRL_SESSVALID	BIT(2)
 #define USBOTGSS_UTMI_OTG_CTRL_VBUSVALID	BIT(1)
+
+enum dwc3_omap_utmi_mode {
+	DWC3_OMAP_UTMI_MODE_UNKNOWN = 0,
+	DWC3_OMAP_UTMI_MODE_HW,
+	DWC3_OMAP_UTMI_MODE_SW,
+};
 
 struct dwc3_omap {
 	struct device		*dev;
@@ -245,7 +242,7 @@ static void dwc3_omap_set_mailbox(struct dwc3_omap *omap,
 		break;
 
 	case OMAP_DWC3_ID_FLOAT:
-		if (omap->vbus_reg)
+		if (omap->vbus_reg && regulator_is_enabled(omap->vbus_reg))
 			regulator_disable(omap->vbus_reg);
 		val = dwc3_omap_read_utmi_ctrl(omap);
 		val |= USBOTGSS_UTMI_OTG_CTRL_IDDIG;
@@ -440,8 +437,13 @@ static int dwc3_omap_extcon_register(struct dwc3_omap *omap)
 
 		if (extcon_get_state(edev, EXTCON_USB) == true)
 			dwc3_omap_set_mailbox(omap, OMAP_DWC3_VBUS_VALID);
+		else
+			dwc3_omap_set_mailbox(omap, OMAP_DWC3_VBUS_OFF);
+
 		if (extcon_get_state(edev, EXTCON_USB_HOST) == true)
 			dwc3_omap_set_mailbox(omap, OMAP_DWC3_ID_GROUND);
+		else
+			dwc3_omap_set_mailbox(omap, OMAP_DWC3_ID_FLOAT);
 
 		omap->edev = edev;
 	}
@@ -454,14 +456,11 @@ static int dwc3_omap_probe(struct platform_device *pdev)
 	struct device_node	*node = pdev->dev.of_node;
 
 	struct dwc3_omap	*omap;
-	struct resource		*res;
 	struct device		*dev = &pdev->dev;
 	struct regulator	*vbus_reg = NULL;
 
 	int			ret;
 	int			irq;
-
-	u32			reg;
 
 	void __iomem		*base;
 
@@ -477,13 +476,10 @@ static int dwc3_omap_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, omap);
 
 	irq = platform_get_irq(pdev, 0);
-	if (irq < 0) {
-		dev_err(dev, "missing IRQ resource: %d\n", irq);
+	if (irq < 0)
 		return irq;
-	}
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	base = devm_ioremap_resource(dev, res);
+	base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(base))
 		return PTR_ERR(base);
 
@@ -510,9 +506,6 @@ static int dwc3_omap_probe(struct platform_device *pdev)
 	dwc3_omap_map_offset(omap);
 	dwc3_omap_set_utmi_mode(omap);
 
-	/* check the DMA Status */
-	reg = dwc3_omap_readl(omap->base, USBOTGSS_SYSCONFIG);
-
 	ret = dwc3_omap_extcon_register(omap);
 	if (ret < 0)
 		goto err1;
@@ -529,11 +522,13 @@ static int dwc3_omap_probe(struct platform_device *pdev)
 	if (ret) {
 		dev_err(dev, "failed to request IRQ #%d --> %d\n",
 			omap->irq, ret);
-		goto err1;
+		goto err2;
 	}
 	dwc3_omap_enable_irqs(omap);
 	return 0;
 
+err2:
+	of_platform_depopulate(dev);
 err1:
 	pm_runtime_put_sync(dev);
 	pm_runtime_disable(dev);
@@ -541,7 +536,7 @@ err1:
 	return ret;
 }
 
-static int dwc3_omap_remove(struct platform_device *pdev)
+static void dwc3_omap_remove(struct platform_device *pdev)
 {
 	struct dwc3_omap	*omap = platform_get_drvdata(pdev);
 
@@ -550,8 +545,6 @@ static int dwc3_omap_remove(struct platform_device *pdev)
 	of_platform_depopulate(omap->dev);
 	pm_runtime_put_sync(&pdev->dev);
 	pm_runtime_disable(&pdev->dev);
-
-	return 0;
 }
 
 static const struct of_device_id of_dwc3_match[] = {
@@ -618,7 +611,7 @@ static const struct dev_pm_ops dwc3_omap_dev_pm_ops = {
 
 static struct platform_driver dwc3_omap_driver = {
 	.probe		= dwc3_omap_probe,
-	.remove		= dwc3_omap_remove,
+	.remove_new	= dwc3_omap_remove,
 	.driver		= {
 		.name	= "omap-dwc3",
 		.of_match_table	= of_dwc3_match,

@@ -1,12 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * ati_remote2 - ATI/Philips USB RF remote driver
  *
  * Copyright (C) 2005-2008 Ville Syrjala <syrjala@sci.fi>
  * Copyright (C) 2007-2008 Peter Stokes <linux@dadeos.co.uk>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2
- * as published by the Free Software Foundation.
  */
 
 #include <linux/usb/input.h>
@@ -14,17 +11,15 @@
 #include <linux/module.h>
 
 #define DRIVER_DESC    "ATI/Philips USB RF remote driver"
-#define DRIVER_VERSION "0.3"
 
 MODULE_DESCRIPTION(DRIVER_DESC);
-MODULE_VERSION(DRIVER_VERSION);
 MODULE_AUTHOR("Ville Syrjala <syrjala@sci.fi>");
 MODULE_LICENSE("GPL");
 
 /*
  * ATI Remote Wonder II Channel Configuration
  *
- * The remote control can by assigned one of sixteen "channels" in order to facilitate
+ * The remote control can be assigned one of sixteen "channels" in order to facilitate
  * the use of multiple remote controls within range of each other.
  * A remote's "channel" may be altered by pressing and holding the "PC" button for
  * approximately 3 seconds, after which the button will slowly flash the count of the
@@ -73,7 +68,7 @@ static int ati_remote2_get_channel_mask(char *buffer,
 {
 	pr_debug("%s()\n", __func__);
 
-	return sprintf(buffer, "0x%04x", *(unsigned int *)kp->arg);
+	return sprintf(buffer, "0x%04x\n", *(unsigned int *)kp->arg);
 }
 
 static int ati_remote2_set_mode_mask(const char *val,
@@ -89,7 +84,7 @@ static int ati_remote2_get_mode_mask(char *buffer,
 {
 	pr_debug("%s()\n", __func__);
 
-	return sprintf(buffer, "0x%02x", *(unsigned int *)kp->arg);
+	return sprintf(buffer, "0x%02x\n", *(unsigned int *)kp->arg);
 }
 
 static unsigned int channel_mask = ATI_REMOTE2_MAX_CHANNEL_MASK;
@@ -209,26 +204,7 @@ struct ati_remote2 {
 	unsigned int mode_mask;
 };
 
-static int ati_remote2_probe(struct usb_interface *interface, const struct usb_device_id *id);
-static void ati_remote2_disconnect(struct usb_interface *interface);
-static int ati_remote2_suspend(struct usb_interface *interface, pm_message_t message);
-static int ati_remote2_resume(struct usb_interface *interface);
-static int ati_remote2_reset_resume(struct usb_interface *interface);
-static int ati_remote2_pre_reset(struct usb_interface *interface);
-static int ati_remote2_post_reset(struct usb_interface *interface);
-
-static struct usb_driver ati_remote2_driver = {
-	.name       = "ati_remote2",
-	.probe      = ati_remote2_probe,
-	.disconnect = ati_remote2_disconnect,
-	.id_table   = ati_remote2_id_table,
-	.suspend    = ati_remote2_suspend,
-	.resume     = ati_remote2_resume,
-	.reset_resume = ati_remote2_reset_resume,
-	.pre_reset  = ati_remote2_pre_reset,
-	.post_reset = ati_remote2_post_reset,
-	.supports_autosuspend = 1,
-};
+static struct usb_driver ati_remote2_driver;
 
 static int ati_remote2_submit_urbs(struct ati_remote2 *ar2)
 {
@@ -644,7 +620,7 @@ static int ati_remote2_urb_init(struct ati_remote2 *ar2)
 			return -ENOMEM;
 
 		pipe = usb_rcvintpipe(udev, ar2->ep[i]->bEndpointAddress);
-		maxp = usb_maxpacket(udev, pipe, usb_pipeout(pipe));
+		maxp = usb_maxpacket(udev, pipe);
 		maxp = maxp > 4 ? 4 : maxp;
 
 		usb_fill_int_urb(ar2->urb[i], udev, pipe, ar2->buf[i], maxp,
@@ -796,10 +772,7 @@ static struct attribute *ati_remote2_attrs[] = {
 	&dev_attr_mode_mask.attr,
 	NULL,
 };
-
-static struct attribute_group ati_remote2_attr_group = {
-	.attrs = ati_remote2_attrs,
-};
+ATTRIBUTE_GROUPS(ati_remote2);
 
 static int ati_remote2_probe(struct usb_interface *interface, const struct usb_device_id *id)
 {
@@ -866,13 +839,9 @@ static int ati_remote2_probe(struct usb_interface *interface, const struct usb_d
 
 	strlcat(ar2->name, "ATI Remote Wonder II", sizeof(ar2->name));
 
-	r = sysfs_create_group(&udev->dev.kobj, &ati_remote2_attr_group);
-	if (r)
-		goto fail3;
-
 	r = ati_remote2_input_init(ar2);
 	if (r)
-		goto fail4;
+		goto fail3;
 
 	usb_set_intfdata(interface, ar2);
 
@@ -880,8 +849,6 @@ static int ati_remote2_probe(struct usb_interface *interface, const struct usb_d
 
 	return 0;
 
- fail4:
-	sysfs_remove_group(&udev->dev.kobj, &ati_remote2_attr_group);
  fail3:
 	ati_remote2_urb_cleanup(ar2);
  fail2:
@@ -904,8 +871,6 @@ static void ati_remote2_disconnect(struct usb_interface *interface)
 	usb_set_intfdata(interface, NULL);
 
 	input_unregister_device(ar2->idev);
-
-	sysfs_remove_group(&ar2->udev->dev.kobj, &ati_remote2_attr_group);
 
 	ati_remote2_urb_cleanup(ar2);
 
@@ -1036,5 +1001,19 @@ static int ati_remote2_post_reset(struct usb_interface *interface)
 
 	return r;
 }
+
+static struct usb_driver ati_remote2_driver = {
+	.name       = "ati_remote2",
+	.probe      = ati_remote2_probe,
+	.disconnect = ati_remote2_disconnect,
+	.dev_groups = ati_remote2_groups,
+	.id_table   = ati_remote2_id_table,
+	.suspend    = ati_remote2_suspend,
+	.resume     = ati_remote2_resume,
+	.reset_resume = ati_remote2_reset_resume,
+	.pre_reset  = ati_remote2_pre_reset,
+	.post_reset = ati_remote2_post_reset,
+	.supports_autosuspend = 1,
+};
 
 module_usb_driver(ati_remote2_driver);

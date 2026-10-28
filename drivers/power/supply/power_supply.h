@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  *  Functions private to power supply class
  *
@@ -6,8 +7,6 @@
  *  Copyright © 2003  Ian Molton <spyro@f2s.com>
  *
  *  Modified: 2004, Oct     Szabolcs Gyurko
- *
- *  You may use this code as per GPL version 2
  */
 
 struct device;
@@ -16,12 +15,14 @@ struct power_supply;
 
 #ifdef CONFIG_SYSFS
 
-extern void power_supply_init_attrs(struct device_type *dev_type);
-extern int power_supply_uevent(struct device *dev, struct kobj_uevent_env *env);
+extern void power_supply_init_attrs(void);
+extern int power_supply_uevent(const struct device *dev, struct kobj_uevent_env *env);
+extern const struct attribute_group *power_supply_attr_groups[];
 
 #else
 
-static inline void power_supply_init_attrs(struct device_type *dev_type) {}
+static inline void power_supply_init_attrs(void) {}
+#define power_supply_attr_groups NULL
 #define power_supply_uevent NULL
 
 #endif /* CONFIG_SYSFS */

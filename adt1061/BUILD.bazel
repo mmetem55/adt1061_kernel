@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Device-specific kernel_build for adt1061.
+#
+
+load(
+    "//build/kernel/kleaf:kernel.bzl",
+    "dtbo",
+    "kernel_abi",
+    "kernel_build",
+    "kernel_compile_commands",
+    "kernel_images",
+    "kernel_modules_install",
+)
+
+package(default_visibility = ["//visibility:public"])
+
+kernel_build(
+    name = "adt1061_kernel",
+    module_signing_key = "//common/adt1061/keys:signing_key.pem",
+    pre_defconfig_fragments = ["adt1061.fragment"],
+    srcs = ["//common:kernel_aarch64_sources"],
+    outs = [
+        "arch/arm64/boot/dts/sprd/adt1061.dtb",
+    ],
+    arch = "arm64",
+    base_kernel = "//common:kernel_aarch64",
+    collect_unstripped_modules = True,
+    defconfig = "//common:arch/arm64/configs/gki_defconfig",
+    make_goals = [
+        "modules",
+        "sprd/adt1061.dtb",
+    ],
+    makefile = "//common:Makefile",
+    module_outs = [
+        "net/wireless/cfg80211.ko",
+        # "system" dma-buf heap used by sprd_npu (not part of GKI's defconfig)
+        "drivers/dma-buf/heaps/system_heap.ko",
+    ],
+    strip_modules = True,
+)

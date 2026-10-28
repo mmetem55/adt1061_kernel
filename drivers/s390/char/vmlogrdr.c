@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  *	character device driver for reading z/VM system service records
  *
@@ -95,7 +96,6 @@ static const struct file_operations vmlogrdr_fops = {
 	.open    = vmlogrdr_open,
 	.release = vmlogrdr_release,
 	.read    = vmlogrdr_read,
-	.llseek  = no_llseek,
 };
 
 
@@ -152,7 +152,7 @@ static struct vmlogrdr_priv_t sys_ser[] = {
 	}
 };
 
-#define MAXMINOR  (sizeof(sys_ser)/sizeof(struct vmlogrdr_priv_t))
+#define MAXMINOR  ARRAY_SIZE(sys_ser)
 
 static char FENCE[] = {"EOR"};
 static int vmlogrdr_major = 0;
@@ -678,34 +678,12 @@ static const struct attribute_group *vmlogrdr_attr_groups[] = {
 	NULL,
 };
 
-static int vmlogrdr_pm_prepare(struct device *dev)
-{
-	int rc;
-	struct vmlogrdr_priv_t *priv = dev_get_drvdata(dev);
-
-	rc = 0;
-	if (priv) {
-		spin_lock_bh(&priv->priv_lock);
-		if (priv->dev_in_use)
-			rc = -EBUSY;
-		spin_unlock_bh(&priv->priv_lock);
-	}
-	if (rc)
-		pr_err("vmlogrdr: device %s is busy. Refuse to suspend.\n",
-		       dev_name(dev));
-	return rc;
-}
-
-
-static const struct dev_pm_ops vmlogrdr_pm_ops = {
-	.prepare = vmlogrdr_pm_prepare,
+static const struct class vmlogrdr_class = {
+	.name = "vmlogrdr_class",
 };
-
-static struct class *vmlogrdr_class;
 static struct device_driver vmlogrdr_driver = {
 	.name = "vmlogrdr",
 	.bus  = &iucv_bus,
-	.pm = &vmlogrdr_pm_ops,
 	.groups = vmlogrdr_drv_attr_groups,
 };
 
@@ -722,12 +700,9 @@ static int vmlogrdr_register_driver(void)
 	if (ret)
 		goto out_iucv;
 
-	vmlogrdr_class = class_create(THIS_MODULE, "vmlogrdr");
-	if (IS_ERR(vmlogrdr_class)) {
-		ret = PTR_ERR(vmlogrdr_class);
-		vmlogrdr_class = NULL;
+	ret = class_register(&vmlogrdr_class);
+	if (ret)
 		goto out_driver;
-	}
 	return 0;
 
 out_driver:
@@ -741,8 +716,7 @@ out:
 
 static void vmlogrdr_unregister_driver(void)
 {
-	class_destroy(vmlogrdr_class);
-	vmlogrdr_class = NULL;
+	class_unregister(&vmlogrdr_class);
 	driver_unregister(&vmlogrdr_driver);
 	iucv_unregister(&vmlogrdr_iucv_handler, 1);
 }
@@ -753,23 +727,9 @@ static int vmlogrdr_register_device(struct vmlogrdr_priv_t *priv)
 	struct device *dev;
 	int ret;
 
-	dev = kzalloc(sizeof(struct device), GFP_KERNEL);
-	if (dev) {
-		dev_set_name(dev, "%s", priv->internal_name);
-		dev->bus = &iucv_bus;
-		dev->parent = iucv_root;
-		dev->driver = &vmlogrdr_driver;
-		dev->groups = vmlogrdr_attr_groups;
-		dev_set_drvdata(dev, priv);
-		/*
-		 * The release function could be called after the
-		 * module has been unloaded. It's _only_ task is to
-		 * free the struct. Therefore, we specify kfree()
-		 * directly here. (Probably a little bit obfuscating
-		 * but legitime ...).
-		 */
-		dev->release = (void (*)(struct device *))kfree;
-	} else
+	dev = iucv_alloc_device(vmlogrdr_attr_groups, &vmlogrdr_driver,
+				priv, priv->internal_name);
+	if (!dev)
 		return -ENOMEM;
 	ret = device_register(dev);
 	if (ret) {
@@ -777,7 +737,7 @@ static int vmlogrdr_register_device(struct vmlogrdr_priv_t *priv)
 		return ret;
 	}
 
-	priv->class_device = device_create(vmlogrdr_class, dev,
+	priv->class_device = device_create(&vmlogrdr_class, dev,
 					   MKDEV(vmlogrdr_major,
 						 priv->minor_num),
 					   priv, "%s", dev_name(dev));
@@ -794,7 +754,7 @@ static int vmlogrdr_register_device(struct vmlogrdr_priv_t *priv)
 
 static int vmlogrdr_unregister_device(struct vmlogrdr_priv_t *priv)
 {
-	device_destroy(vmlogrdr_class, MKDEV(vmlogrdr_major, priv->minor_num));
+	device_destroy(&vmlogrdr_class, MKDEV(vmlogrdr_major, priv->minor_num));
 	if (priv->device != NULL) {
 		device_unregister(priv->device);
 		priv->device=NULL;
@@ -812,8 +772,7 @@ static int vmlogrdr_register_cdev(dev_t dev)
 	}
 	vmlogrdr_cdev->owner = THIS_MODULE;
 	vmlogrdr_cdev->ops = &vmlogrdr_fops;
-	vmlogrdr_cdev->dev = dev;
-	rc = cdev_add(vmlogrdr_cdev, vmlogrdr_cdev->dev, MAXMINOR);
+	rc = cdev_add(vmlogrdr_cdev, dev, MAXMINOR);
 	if (!rc)
 		return 0;
 

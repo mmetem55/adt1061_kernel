@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * CXL Flash Device Driver
  *
@@ -5,15 +6,12 @@
  *             Matthew R. Ochs <mrochs@linux.vnet.ibm.com>, IBM Corporation
  *
  * Copyright (C) 2015 IBM Corporation
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version
- * 2 of the License, or (at your option) any later version.
  */
 
-#include <misc/cxl.h>
-#include <asm/unaligned.h>
+#include <linux/unaligned.h>
+
+#include <linux/interrupt.h>
+#include <linux/pci.h>
 
 #include <scsi/scsi_host.h>
 #include <uapi/scsi/cxlflash_ioctl.h>
@@ -218,7 +216,7 @@ void cxlflash_term_global_luns(void)
 /**
  * cxlflash_manage_lun() - handles LUN management activities
  * @sdev:	SCSI device associated with LUN.
- * @manage:	Manage ioctl data structure.
+ * @arg:	Manage ioctl data structure.
  *
  * This routine is used to notify the driver about a LUN's WWID and associate
  * SCSI devices (sdev) with a global LUN instance. Additionally it serves to
@@ -226,9 +224,9 @@ void cxlflash_term_global_luns(void)
  *
  * Return: 0 on success, -errno on failure
  */
-int cxlflash_manage_lun(struct scsi_device *sdev,
-			struct dk_cxlflash_manage_lun *manage)
+int cxlflash_manage_lun(struct scsi_device *sdev, void *arg)
 {
+	struct dk_cxlflash_manage_lun *manage = arg;
 	struct cxlflash_cfg *cfg = shost_priv(sdev->host);
 	struct device *dev = &cfg->dev->dev;
 	struct llun_info *lli = NULL;

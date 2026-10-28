@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * u_fs.h
  *
@@ -6,11 +7,7 @@
  * Copyright (c) 2013 Samsung Electronics Co., Ltd.
  *		http://www.samsung.com
  *
- * Author: Andrzej Pietrasiewicz <andrzej.p@samsung.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
+ * Author: Andrzej Pietrasiewicz <andrzejtp2010@gmail.com>
  */
 
 #ifndef U_FFS_H
@@ -34,8 +31,6 @@
 #endif /* pr_vdebug */
 #  define ffs_dump_mem(prefix, ptr, len) do { } while (0)
 #endif /* VERBOSE_DEBUG */
-
-#define ENTER()    pr_vdebug("%s()\n", __func__)
 
 struct f_fs_opts;
 
@@ -257,8 +252,14 @@ struct ffs_data {
 
 	unsigned short			strings_count;
 	unsigned short			interfaces_count;
+
+	/*
+	 * eps_count tracks the number of underlying hardware endpoints.
+	 * epfiles_count tracks the total number of VFS endpoint files.
+	 * When companion endpoints are active, epfiles_count > eps_count.
+	 */
 	unsigned short			eps_count;
-	unsigned short			_pad1;
+	unsigned short			epfiles_count;
 
 	/* filled by __ffs_data_got_strings() */
 	/* ids in stringtabs are set in functionfs_bind() */

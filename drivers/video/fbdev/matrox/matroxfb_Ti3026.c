@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  *
  * Hardware accelerated Matrox Millennium I, II, Mystique, G100, G200 and G400
@@ -745,4 +746,5 @@ struct matrox_switch matrox_millennium = {
 };
 EXPORT_SYMBOL(matrox_millennium);
 #endif
+MODULE_DESCRIPTION("Matrox Millennium output driver");
 MODULE_LICENSE("GPL");

@@ -4,13 +4,12 @@
 #include <linux/hwspinlock.h>
 #include <linux/module.h>
 #include <linux/of.h>
-#include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/nvmem-provider.h>
 
 /* PMIC global registers definition */
-#define SC2731_MODULE_EN		0xc08
+#define SC27XX_MODULE_EN		0xc08
 #define SC2730_MODULE_EN		0x1808
 #define SC27XX_EFUSE_EN			BIT(6)
 
@@ -43,7 +42,6 @@
 /* Block number and block width (bytes) definitions */
 #define SC27XX_EFUSE_BLOCK_MAX		32
 #define SC27XX_EFUSE_BLOCK_WIDTH	2
-#define SC27XX_EFUSE_BLOCK_SIZE	(SC27XX_EFUSE_BLOCK_WIDTH * BITS_PER_BYTE)
 
 /* Timeout (ms) for the trylock of hardware spinlocks */
 #define SC27XX_EFUSE_HWLOCK_TIMEOUT	5000
@@ -70,7 +68,7 @@ struct sc27xx_efuse {
 };
 
 static const struct sc27xx_efuse_variant_data sc2731_edata = {
-	.module_en = SC2731_MODULE_EN,
+	.module_en = SC27XX_MODULE_EN,
 };
 
 static const struct sc27xx_efuse_variant_data sc2730_edata = {
@@ -126,11 +124,12 @@ static int sc27xx_efuse_poll_status(struct sc27xx_efuse *efuse, u32 bits)
 static int sc27xx_efuse_read(void *context, u32 offset, void *val, size_t bytes)
 {
 	struct sc27xx_efuse *efuse = context;
-	u32 buf, index = offset / SC27XX_EFUSE_BLOCK_WIDTH;
+	u32 buf, blk_index = offset / SC27XX_EFUSE_BLOCK_WIDTH;
 	u32 blk_offset = (offset % SC27XX_EFUSE_BLOCK_WIDTH) * BITS_PER_BYTE;
 	int ret;
 
-	if (index >= SC27XX_EFUSE_BLOCK_MAX || bytes > SC27XX_EFUSE_BLOCK_WIDTH)
+	if (blk_index > SC27XX_EFUSE_BLOCK_MAX ||
+	    bytes > SC27XX_EFUSE_BLOCK_WIDTH)
 		return -EINVAL;
 
 	ret = sc27xx_efuse_lock(efuse);
@@ -154,7 +153,7 @@ static int sc27xx_efuse_read(void *context, u32 offset, void *val, size_t bytes)
 	/* Set the block address to be read. */
 	ret = regmap_write(efuse->regmap,
 			   efuse->base + SC27XX_EFUSE_BLOCK_INDEX,
-			   index & SC27XX_EFUSE_BLOCK_MASK);
+			   blk_index & SC27XX_EFUSE_BLOCK_MASK);
 	if (ret)
 		goto disable_efuse;
 
@@ -206,14 +205,7 @@ static int sc27xx_efuse_probe(struct platform_device *pdev)
 	struct nvmem_config econfig = { };
 	struct nvmem_device *nvmem;
 	struct sc27xx_efuse *efuse;
-	const struct sc27xx_efuse_variant_data *pdata;
 	int ret;
-
-	pdata = of_device_get_match_data(&pdev->dev);
-	if (!pdata) {
-		dev_err(&pdev->dev, "No matching driver data found\n");
-		return -EINVAL;
-	}
 
 	efuse = devm_kzalloc(&pdev->dev, sizeof(*efuse), GFP_KERNEL);
 	if (!efuse)
@@ -237,7 +229,7 @@ static int sc27xx_efuse_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	efuse->hwlock = hwspin_lock_request_specific(ret);
+	efuse->hwlock = devm_hwspin_lock_request_specific(&pdev->dev, ret);
 	if (!efuse->hwlock) {
 		dev_err(&pdev->dev, "failed to request hwspinlock\n");
 		return -ENXIO;
@@ -245,8 +237,7 @@ static int sc27xx_efuse_probe(struct platform_device *pdev)
 
 	mutex_init(&efuse->mutex);
 	efuse->dev = &pdev->dev;
-	efuse->var_data = pdata;
-	platform_set_drvdata(pdev, efuse);
+	efuse->var_data = of_device_get_match_data(&pdev->dev);
 
 	econfig.stride = 1;
 	econfig.word_size = 1;
@@ -256,34 +247,25 @@ static int sc27xx_efuse_probe(struct platform_device *pdev)
 	econfig.reg_read = sc27xx_efuse_read;
 	econfig.priv = efuse;
 	econfig.dev = &pdev->dev;
+	econfig.add_legacy_fixed_of_cells = true;
 	nvmem = devm_nvmem_register(&pdev->dev, &econfig);
 	if (IS_ERR(nvmem)) {
 		dev_err(&pdev->dev, "failed to register nvmem config\n");
-		hwspin_lock_free(efuse->hwlock);
 		return PTR_ERR(nvmem);
 	}
 
 	return 0;
 }
 
-static int sc27xx_efuse_remove(struct platform_device *pdev)
-{
-	struct sc27xx_efuse *efuse = platform_get_drvdata(pdev);
-
-	hwspin_lock_free(efuse->hwlock);
-	return 0;
-}
-
 static const struct of_device_id sc27xx_efuse_of_match[] = {
 	{ .compatible = "sprd,sc2731-efuse", .data = &sc2731_edata},
 	{ .compatible = "sprd,sc2730-efuse", .data = &sc2730_edata},
-	{ .compatible = "sprd,sc2721-efuse", .data = &sc2731_edata},
 	{ }
 };
+MODULE_DEVICE_TABLE(of, sc27xx_efuse_of_match);
 
 static struct platform_driver sc27xx_efuse_driver = {
 	.probe = sc27xx_efuse_probe,
-	.remove = sc27xx_efuse_remove,
 	.driver = {
 		.name = "sc27xx-efuse",
 		.of_match_table = sc27xx_efuse_of_match,

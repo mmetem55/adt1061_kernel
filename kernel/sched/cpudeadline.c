@@ -1,20 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
- *  kernel/sched/cpudl.c
+ *  kernel/sched/cpudeadline.c
  *
  *  Global CPU deadline management
  *
  *  Author: Juri Lelli <j.lelli@sssup.it>
- *
- *  This program is free software; you can redistribute it and/or
- *  modify it under the terms of the GNU General Public License
- *  as published by the Free Software Foundation; version 2
- *  of the License.
  */
-
-#include <linux/gfp.h>
-#include <linux/kernel.h>
-#include <linux/slab.h>
-#include "cpudeadline.h"
 
 static inline int parent(int i)
 {
@@ -42,8 +33,9 @@ static void cpudl_heapify_down(struct cpudl *cp, int idx)
 		return;
 
 	/* adapted from lib/prio_heap.c */
-	while(1) {
+	while (1) {
 		u64 largest_dl;
+
 		l = left_child(idx);
 		r = right_child(idx);
 		largest = idx;
@@ -121,19 +113,44 @@ static inline int cpudl_maximum(struct cpudl *cp)
  *
  * Returns: int - CPUs were found
  */
-int cpudl_find(struct cpudl *cp, struct task_struct *p,
+int cpudl_find(struct cpudl *cp, struct task_struct *sched_ctx, struct task_struct *exec_ctx,
 	       struct cpumask *later_mask)
 {
-	const struct sched_dl_entity *dl_se = &p->dl;
+	const struct sched_dl_entity *dl_se = &sched_ctx->dl;
 
 	if (later_mask &&
-	    cpumask_and(later_mask, cp->free_cpus, &p->cpus_allowed)) {
+	    cpumask_and(later_mask, cp->free_cpus, &exec_ctx->cpus_mask)) {
+		unsigned long cap, max_cap = 0;
+		int cpu, max_cpu = -1;
+
+		if (!sched_asym_cpucap_active())
+			return 1;
+
+		/* Ensure the capacity of the CPUs fits the task. */
+		for_each_cpu(cpu, later_mask) {
+			if (!dl_task_fits_capacity(sched_ctx, cpu)) {
+				cpumask_clear_cpu(cpu, later_mask);
+
+				cap = arch_scale_cpu_capacity(cpu);
+
+				if (cap > max_cap ||
+				    (cpu == task_cpu(exec_ctx) && cap == max_cap)) {
+					max_cap = cap;
+					max_cpu = cpu;
+				}
+			}
+		}
+
+		if (cpumask_empty(later_mask))
+			cpumask_set_cpu(max_cpu, later_mask);
+
 		return 1;
 	} else {
 		int best_cpu = cpudl_maximum(cp);
+
 		WARN_ON(best_cpu != -1 && !cpu_present(best_cpu));
 
-		if (cpumask_test_cpu(best_cpu, &p->cpus_allowed) &&
+		if (cpumask_test_cpu(best_cpu, &exec_ctx->cpus_mask) &&
 		    dl_time_before(dl_se->deadline, cp->elements[0].dl)) {
 			if (later_mask)
 				cpumask_set_cpu(best_cpu, later_mask);
@@ -145,15 +162,16 @@ int cpudl_find(struct cpudl *cp, struct task_struct *p,
 }
 
 /*
- * cpudl_clear - remove a cpu from the cpudl max-heap
+ * cpudl_clear - remove a CPU from the cpudl max-heap
  * @cp: the cpudl max-heap context
- * @cpu: the target cpu
+ * @cpu: the target CPU
+ * @online: the online state of the deadline runqueue
  *
  * Notes: assumes cpu_rq(cpu)->lock is locked
  *
  * Returns: (void)
  */
-void cpudl_clear(struct cpudl *cp, int cpu)
+void cpudl_clear(struct cpudl *cp, int cpu, bool online)
 {
 	int old_idx, new_cpu;
 	unsigned long flags;
@@ -166,7 +184,7 @@ void cpudl_clear(struct cpudl *cp, int cpu)
 	if (old_idx == IDX_INVALID) {
 		/*
 		 * Nothing to remove if old_idx was invalid.
-		 * This could happen if a rq_offline_dl is
+		 * This could happen if rq_online_dl or rq_offline_dl is
 		 * called for a CPU without -dl tasks running.
 		 */
 	} else {
@@ -177,17 +195,20 @@ void cpudl_clear(struct cpudl *cp, int cpu)
 		cp->elements[new_cpu].idx = old_idx;
 		cp->elements[cpu].idx = IDX_INVALID;
 		cpudl_heapify(cp, old_idx);
-
-		cpumask_set_cpu(cpu, cp->free_cpus);
 	}
+	if (likely(online))
+		__cpumask_set_cpu(cpu, cp->free_cpus);
+	else
+		__cpumask_clear_cpu(cpu, cp->free_cpus);
+
 	raw_spin_unlock_irqrestore(&cp->lock, flags);
 }
 
 /*
  * cpudl_set - update the cpudl max-heap
  * @cp: the cpudl max-heap context
- * @cpu: the target cpu
- * @dl: the new earliest deadline for this cpu
+ * @cpu: the target CPU
+ * @dl: the new earliest deadline for this CPU
  *
  * Notes: assumes cpu_rq(cpu)->lock is locked
  *
@@ -205,37 +226,18 @@ void cpudl_set(struct cpudl *cp, int cpu, u64 dl)
 	old_idx = cp->elements[cpu].idx;
 	if (old_idx == IDX_INVALID) {
 		int new_idx = cp->size++;
+
 		cp->elements[new_idx].dl = dl;
 		cp->elements[new_idx].cpu = cpu;
 		cp->elements[cpu].idx = new_idx;
 		cpudl_heapify_up(cp, new_idx);
-		cpumask_clear_cpu(cpu, cp->free_cpus);
+		__cpumask_clear_cpu(cpu, cp->free_cpus);
 	} else {
 		cp->elements[old_idx].dl = dl;
 		cpudl_heapify(cp, old_idx);
 	}
 
 	raw_spin_unlock_irqrestore(&cp->lock, flags);
-}
-
-/*
- * cpudl_set_freecpu - Set the cpudl.free_cpus
- * @cp: the cpudl max-heap context
- * @cpu: rd attached cpu
- */
-void cpudl_set_freecpu(struct cpudl *cp, int cpu)
-{
-	cpumask_set_cpu(cpu, cp->free_cpus);
-}
-
-/*
- * cpudl_clear_freecpu - Clear the cpudl.free_cpus
- * @cp: the cpudl max-heap context
- * @cpu: rd attached cpu
- */
-void cpudl_clear_freecpu(struct cpudl *cp, int cpu)
-{
-	cpumask_clear_cpu(cpu, cp->free_cpus);
 }
 
 /*

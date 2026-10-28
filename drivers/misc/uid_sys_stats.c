@@ -14,26 +14,52 @@
  */
 
 #include <linux/atomic.h>
-#include <linux/cpufreq_times.h>
 #include <linux/err.h>
 #include <linux/hashtable.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
+#include <linux/llist.h>
 #include <linux/mm.h>
 #include <linux/proc_fs.h>
 #include <linux/profile.h>
-#include <linux/rtmutex.h>
 #include <linux/sched/cputime.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
-
+#include <linux/spinlock_types.h>
+#include <linux/pm_qos.h>
+#include <trace/hooks/power.h>
 
 #define UID_HASH_BITS	10
+#define UID_HASH_NUMS	(1 << UID_HASH_BITS)
 DECLARE_HASHTABLE(hash_table, UID_HASH_BITS);
+/* uid_lock[bkt] ensure consistency of hash_table[bkt] */
+spinlock_t uid_lock[UID_HASH_NUMS];
 
-static DEFINE_RT_MUTEX(uid_lock);
+#define for_each_bkt(bkt) \
+	for (bkt = 0; bkt < HASH_SIZE(hash_table); bkt++)
+
+/* iterate over all uid_entrys hashing to the same bkt */
+#define for_each_uid_entry(uid_entry, bkt) \
+	hlist_for_each_entry(uid_entry, &hash_table[bkt], hash)
+
+#define for_each_uid_entry_safe(uid_entry, tmp, bkt) \
+	hlist_for_each_entry_safe(uid_entry, tmp,\
+			&hash_table[bkt], hash)
+
+#define UPDATE_ANDROID_OEM_DATA(target, source, task, type) \
+	trace_android_vh_update_uid_stats(target, source, task, type)
+
+#ifdef CONFIG_ANDROID_VENDOR_OEM_DATA
+#define OEM_DATA(x) ((x)->android_oem_data1)
+#define OEM_DATA_PTR(x) (&(x)->android_oem_data1)
+#else
+static inline u64 *oem_data_ptr(void *x) { return NULL; }
+#define OEM_DATA(x) 0
+#define OEM_DATA_PTR(x) oem_data_ptr(x)
+#endif
+
 static struct proc_dir_entry *cpu_parent;
 static struct proc_dir_entry *io_parent;
 static struct proc_dir_entry *proc_parent;
@@ -48,12 +74,9 @@ struct io_stats {
 
 #define UID_STATE_FOREGROUND	0
 #define UID_STATE_BACKGROUND	1
-#define UID_STATE_BUCKET_SIZE	2
-
-#define UID_STATE_TOTAL_CURR	2
-#define UID_STATE_TOTAL_LAST	3
-#define UID_STATE_DEAD_TASKS	4
-#define UID_STATE_SIZE		5
+#define UID_STATE_TOTAL_LAST	2
+#define UID_STATE_DEAD_TASKS	3
+#define UID_STATE_SIZE		4
 
 #define MAX_TASK_COMM_LEN 256
 
@@ -68,22 +91,58 @@ struct uid_entry {
 	uid_t uid;
 	u64 utime;
 	u64 stime;
-	u64 active_utime;
-	u64 active_stime;
 	int state;
 	struct io_stats io[UID_STATE_SIZE];
 	struct hlist_node hash;
-#ifdef CONFIG_UID_SYS_STATS_DEBUG
-	DECLARE_HASHTABLE(task_entries, UID_HASH_BITS);
-#endif
+
+	ANDROID_OEM_DATA(1);
 };
 
-static u64 compute_write_bytes(struct task_struct *task)
+static void init_hash_table_and_lock(void)
 {
-	if (task->ioac.write_bytes <= task->ioac.cancelled_write_bytes)
+	int i;
+
+	hash_init(hash_table);
+	for (i = 0; i < UID_HASH_NUMS; i++)
+		spin_lock_init(&uid_lock[i]);
+}
+
+static inline int uid_to_bkt(uid_t uid)
+{
+	return hash_min(uid, HASH_BITS(hash_table));
+}
+
+static inline int trylock_uid(uid_t uid)
+{
+	return spin_trylock(&uid_lock[uid_to_bkt(uid)]);
+}
+
+static inline void lock_uid(uid_t uid)
+{
+	spin_lock(&uid_lock[uid_to_bkt(uid)]);
+}
+
+static inline void unlock_uid(uid_t uid)
+{
+	spin_unlock(&uid_lock[uid_to_bkt(uid)]);
+}
+
+static inline void lock_uid_by_bkt(u32 bkt)
+{
+	spin_lock(&uid_lock[bkt]);
+}
+
+static inline void unlock_uid_by_bkt(u32 bkt)
+{
+	spin_unlock(&uid_lock[bkt]);
+}
+
+static u64 compute_write_bytes(struct task_io_accounting *ioac)
+{
+	if (ioac->write_bytes <= ioac->cancelled_write_bytes)
 		return 0;
 
-	return task->ioac.write_bytes - task->ioac.cancelled_write_bytes;
+	return ioac->write_bytes - ioac->cancelled_write_bytes;
 }
 
 static void compute_io_bucket_stats(struct io_stats *io_bucket,
@@ -119,189 +178,12 @@ static void compute_io_bucket_stats(struct io_stats *io_bucket,
 	memset(io_dead, 0, sizeof(struct io_stats));
 }
 
-#ifdef CONFIG_UID_SYS_STATS_DEBUG
-static void get_full_task_comm(struct task_entry *task_entry,
-		struct task_struct *task)
-{
-	int i = 0, offset = 0, len = 0;
-	/* save one byte for terminating null character */
-	int unused_len = MAX_TASK_COMM_LEN - TASK_COMM_LEN - 1;
-	char buf[unused_len];
-	struct mm_struct *mm = task->mm;
-
-	/* fill the first TASK_COMM_LEN bytes with thread name */
-	__get_task_comm(task_entry->comm, TASK_COMM_LEN, task);
-	i = strlen(task_entry->comm);
-	while (i < TASK_COMM_LEN)
-		task_entry->comm[i++] = ' ';
-
-	/* next the executable file name */
-	if (mm) {
-		down_read(&mm->mmap_sem);
-		if (mm->exe_file) {
-			char *pathname = d_path(&mm->exe_file->f_path, buf,
-					unused_len);
-
-			if (!IS_ERR(pathname)) {
-				len = strlcpy(task_entry->comm + i, pathname,
-						unused_len);
-				i += len;
-				task_entry->comm[i++] = ' ';
-				unused_len--;
-			}
-		}
-		up_read(&mm->mmap_sem);
-	}
-	unused_len -= len;
-
-	/* fill the rest with command line argument
-	 * replace each null or new line character
-	 * between args in argv with whitespace */
-	len = get_cmdline(task, buf, unused_len);
-	while (offset < len) {
-		if (buf[offset] != '\0' && buf[offset] != '\n')
-			task_entry->comm[i++] = buf[offset];
-		else
-			task_entry->comm[i++] = ' ';
-		offset++;
-	}
-
-	/* get rid of trailing whitespaces in case when arg is memset to
-	 * zero before being reset in userspace
-	 */
-	while (task_entry->comm[i-1] == ' ')
-		i--;
-	task_entry->comm[i] = '\0';
-}
-
-static struct task_entry *find_task_entry(struct uid_entry *uid_entry,
-		struct task_struct *task)
-{
-	struct task_entry *task_entry;
-
-	hash_for_each_possible(uid_entry->task_entries, task_entry, hash,
-			task->pid) {
-		if (task->pid == task_entry->pid) {
-			/* if thread name changed, update the entire command */
-			int len = strnchr(task_entry->comm, ' ', TASK_COMM_LEN)
-				- task_entry->comm;
-
-			if (strncmp(task_entry->comm, task->comm, len))
-				get_full_task_comm(task_entry, task);
-			return task_entry;
-		}
-	}
-	return NULL;
-}
-
-static struct task_entry *find_or_register_task(struct uid_entry *uid_entry,
-		struct task_struct *task)
-{
-	struct task_entry *task_entry;
-	pid_t pid = task->pid;
-
-	task_entry = find_task_entry(uid_entry, task);
-	if (task_entry)
-		return task_entry;
-
-	task_entry = kzalloc(sizeof(struct task_entry), GFP_ATOMIC);
-	if (!task_entry)
-		return NULL;
-
-	get_full_task_comm(task_entry, task);
-
-	task_entry->pid = pid;
-	hash_add(uid_entry->task_entries, &task_entry->hash, (unsigned int)pid);
-
-	return task_entry;
-}
-
-static void remove_uid_tasks(struct uid_entry *uid_entry)
-{
-	struct task_entry *task_entry;
-	unsigned long bkt_task;
-	struct hlist_node *tmp_task;
-
-	hash_for_each_safe(uid_entry->task_entries, bkt_task,
-			tmp_task, task_entry, hash) {
-		hash_del(&task_entry->hash);
-		kfree(task_entry);
-	}
-}
-
-static void set_io_uid_tasks_zero(struct uid_entry *uid_entry)
-{
-	struct task_entry *task_entry;
-	unsigned long bkt_task;
-
-	hash_for_each(uid_entry->task_entries, bkt_task, task_entry, hash) {
-		memset(&task_entry->io[UID_STATE_TOTAL_CURR], 0,
-			sizeof(struct io_stats));
-	}
-}
-
-static void add_uid_tasks_io_stats(struct uid_entry *uid_entry,
-		struct task_struct *task, int slot)
-{
-	struct task_entry *task_entry = find_or_register_task(uid_entry, task);
-	struct io_stats *task_io_slot = &task_entry->io[slot];
-
-	task_io_slot->read_bytes += task->ioac.read_bytes;
-	task_io_slot->write_bytes += compute_write_bytes(task);
-	task_io_slot->rchar += task->ioac.rchar;
-	task_io_slot->wchar += task->ioac.wchar;
-	task_io_slot->fsync += task->ioac.syscfs;
-}
-
-static void compute_io_uid_tasks(struct uid_entry *uid_entry)
-{
-	struct task_entry *task_entry;
-	unsigned long bkt_task;
-
-	hash_for_each(uid_entry->task_entries, bkt_task, task_entry, hash) {
-		compute_io_bucket_stats(&task_entry->io[uid_entry->state],
-					&task_entry->io[UID_STATE_TOTAL_CURR],
-					&task_entry->io[UID_STATE_TOTAL_LAST],
-					&task_entry->io[UID_STATE_DEAD_TASKS]);
-	}
-}
-
-static void show_io_uid_tasks(struct seq_file *m, struct uid_entry *uid_entry)
-{
-	struct task_entry *task_entry;
-	unsigned long bkt_task;
-
-	hash_for_each(uid_entry->task_entries, bkt_task, task_entry, hash) {
-		/* Separated by comma because space exists in task comm */
-		seq_printf(m, "task,%s,%lu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
-				task_entry->comm,
-				(unsigned long)task_entry->pid,
-				task_entry->io[UID_STATE_FOREGROUND].rchar,
-				task_entry->io[UID_STATE_FOREGROUND].wchar,
-				task_entry->io[UID_STATE_FOREGROUND].read_bytes,
-				task_entry->io[UID_STATE_FOREGROUND].write_bytes,
-				task_entry->io[UID_STATE_BACKGROUND].rchar,
-				task_entry->io[UID_STATE_BACKGROUND].wchar,
-				task_entry->io[UID_STATE_BACKGROUND].read_bytes,
-				task_entry->io[UID_STATE_BACKGROUND].write_bytes,
-				task_entry->io[UID_STATE_FOREGROUND].fsync,
-				task_entry->io[UID_STATE_BACKGROUND].fsync);
-	}
-}
-#else
-static void remove_uid_tasks(struct uid_entry *uid_entry) {};
-static void set_io_uid_tasks_zero(struct uid_entry *uid_entry) {};
-static void add_uid_tasks_io_stats(struct uid_entry *uid_entry,
-		struct task_struct *task, int slot) {};
-static void compute_io_uid_tasks(struct uid_entry *uid_entry) {};
-static void show_io_uid_tasks(struct seq_file *m,
-		struct uid_entry *uid_entry) {}
-#endif
-
 static struct uid_entry *find_uid_entry(uid_t uid)
 {
 	struct uid_entry *uid_entry;
-	hash_for_each_possible(hash_table, uid_entry, hash, uid) {
+	u32 bkt = uid_to_bkt(uid);
+
+	for_each_uid_entry(uid_entry, bkt) {
 		if (uid_entry->uid == uid)
 			return uid_entry;
 	}
@@ -321,72 +203,74 @@ static struct uid_entry *find_or_register_uid(uid_t uid)
 		return NULL;
 
 	uid_entry->uid = uid;
-#ifdef CONFIG_UID_SYS_STATS_DEBUG
-	hash_init(uid_entry->task_entries);
-#endif
 	hash_add(hash_table, &uid_entry->hash, uid);
 
 	return uid_entry;
 }
 
+static void calc_uid_cputime(struct uid_entry *uid_entry,
+			u64 *total_utime, u64 *total_stime, u64 *android_oem_data)
+{
+	struct user_namespace *user_ns = current_user_ns();
+	struct task_struct *p, *t;
+	u64 utime, stime;
+	uid_t uid;
+
+	rcu_read_lock();
+	for_each_process(p) {
+		uid = from_kuid_munged(user_ns, task_uid(p));
+
+		if (uid != uid_entry->uid)
+			continue;
+
+		for_each_thread(p, t) {
+			/* avoid double accounting of dying threads */
+			if (!(t->flags & PF_EXITING)) {
+				UPDATE_ANDROID_OEM_DATA(android_oem_data, NULL, t, 3);
+				task_cputime_adjusted(t, &utime, &stime);
+				*total_utime += utime;
+				*total_stime += stime;
+			}
+		}
+	}
+	rcu_read_unlock();
+}
+
 static int uid_cputime_show(struct seq_file *m, void *v)
 {
 	struct uid_entry *uid_entry = NULL;
-	struct task_struct *task, *temp;
-	struct user_namespace *user_ns = current_user_ns();
-	u64 utime;
-	u64 stime;
-	unsigned long bkt;
-	uid_t uid;
+	u32 bkt;
 
-	rt_mutex_lock(&uid_lock);
+	for_each_bkt(bkt) {
+		lock_uid_by_bkt(bkt);
+		for_each_uid_entry(uid_entry, bkt) {
+			u64 total_utime = uid_entry->utime;
+			u64 total_stime = uid_entry->stime;
+			u64 android_oem_data = OEM_DATA(uid_entry);
 
-	hash_for_each(hash_table, bkt, uid_entry, hash) {
-		uid_entry->active_stime = 0;
-		uid_entry->active_utime = 0;
-	}
-
-	rcu_read_lock();
-	do_each_thread(temp, task) {
-		uid = from_kuid_munged(user_ns, task_uid(task));
-		if (!uid_entry || uid_entry->uid != uid)
-			uid_entry = find_or_register_uid(uid);
-		if (!uid_entry) {
-			rcu_read_unlock();
-			rt_mutex_unlock(&uid_lock);
-			pr_err("%s: failed to find the uid_entry for uid %d\n",
-				__func__, uid);
-			return -ENOMEM;
+			calc_uid_cputime(uid_entry, &total_utime,
+				&total_stime, &android_oem_data);
+			seq_printf(m, "%d: %llu %llu\n", uid_entry->uid,
+				ktime_to_us(total_utime), ktime_to_us(total_stime));
+			trace_android_vh_append_total_power(m, uid_entry->uid,
+				total_utime, total_stime, android_oem_data);
 		}
-		task_cputime_adjusted(task, &utime, &stime);
-		uid_entry->active_utime += utime;
-		uid_entry->active_stime += stime;
-	} while_each_thread(temp, task);
-	rcu_read_unlock();
-
-	hash_for_each(hash_table, bkt, uid_entry, hash) {
-		u64 total_utime = uid_entry->utime +
-							uid_entry->active_utime;
-		u64 total_stime = uid_entry->stime +
-							uid_entry->active_stime;
-		seq_printf(m, "%d: %llu %llu\n", uid_entry->uid,
-			ktime_to_us(total_utime), ktime_to_us(total_stime));
+		unlock_uid_by_bkt(bkt);
 	}
 
-	rt_mutex_unlock(&uid_lock);
 	return 0;
 }
 
 static int uid_cputime_open(struct inode *inode, struct file *file)
 {
-	return single_open(file, uid_cputime_show, PDE_DATA(inode));
+	return single_open(file, uid_cputime_show, pde_data(inode));
 }
 
-static const struct file_operations uid_cputime_fops = {
-	.open		= uid_cputime_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
+static const struct proc_ops uid_cputime_fops = {
+	.proc_open	= uid_cputime_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
 };
 
 static int uid_remove_open(struct inode *inode, struct file *file)
@@ -397,8 +281,6 @@ static int uid_remove_open(struct inode *inode, struct file *file)
 static ssize_t uid_remove_write(struct file *file,
 			const char __user *buffer, size_t count, loff_t *ppos)
 {
-	struct uid_entry *uid_entry;
-	struct hlist_node *tmp;
 	char uids[128];
 	char *start_uid, *end_uid = NULL;
 	long int uid_start = 0, uid_end = 0;
@@ -421,117 +303,100 @@ static ssize_t uid_remove_write(struct file *file,
 		return -EINVAL;
 	}
 
-	/* Also remove uids from /proc/uid_time_in_state */
-	cpufreq_task_times_remove_uids(uid_start, uid_end);
-
-	rt_mutex_lock(&uid_lock);
-
 	for (; uid_start <= uid_end; uid_start++) {
-		hash_for_each_possible_safe(hash_table, uid_entry, tmp,
-							hash, (uid_t)uid_start) {
+		struct uid_entry *uid_entry;
+		struct hlist_node *tmp;
+		u32 bkt = uid_to_bkt((uid_t)uid_start);
+
+		lock_uid(uid_start);
+		for_each_uid_entry_safe(uid_entry, tmp, bkt) {
 			if (uid_start == uid_entry->uid) {
-				remove_uid_tasks(uid_entry);
 				hash_del(&uid_entry->hash);
 				kfree(uid_entry);
 			}
 		}
+		unlock_uid(uid_start);
 	}
 
-	rt_mutex_unlock(&uid_lock);
 	return count;
 }
 
-static const struct file_operations uid_remove_fops = {
-	.open		= uid_remove_open,
-	.release	= single_release,
-	.write		= uid_remove_write,
+static const struct proc_ops uid_remove_fops = {
+	.proc_open	= uid_remove_open,
+	.proc_release	= single_release,
+	.proc_write	= uid_remove_write,
 };
 
+static void __add_uid_io_stats(struct uid_entry *uid_entry,
+			struct task_io_accounting *ioac, int slot)
+{
+	struct io_stats *io_slot = &uid_entry->io[slot];
+
+	io_slot->read_bytes += ioac->read_bytes;
+	io_slot->write_bytes += compute_write_bytes(ioac);
+	io_slot->rchar += ioac->rchar;
+	io_slot->wchar += ioac->wchar;
+	io_slot->fsync += ioac->syscfs;
+}
 
 static void add_uid_io_stats(struct uid_entry *uid_entry,
 			struct task_struct *task, int slot)
 {
-	struct io_stats *io_slot = &uid_entry->io[slot];
+	struct task_entry *task_entry __maybe_unused;
 
-	io_slot->read_bytes += task->ioac.read_bytes;
-	io_slot->write_bytes += compute_write_bytes(task);
-	io_slot->rchar += task->ioac.rchar;
-	io_slot->wchar += task->ioac.wchar;
-	io_slot->fsync += task->ioac.syscfs;
+	/* avoid double accounting of dying threads */
+	if (slot != UID_STATE_DEAD_TASKS && (task->flags & PF_EXITING))
+		return;
 
-	add_uid_tasks_io_stats(uid_entry, task, slot);
+	__add_uid_io_stats(uid_entry, &task->ioac, slot);
 }
 
-static void update_io_stats_all_locked(void)
+static void update_io_stats_uid(struct uid_entry *uid_entry)
 {
-	struct uid_entry *uid_entry = NULL;
-	struct task_struct *task, *temp;
 	struct user_namespace *user_ns = current_user_ns();
-	unsigned long bkt;
-	uid_t uid;
+	struct task_struct *p, *t;
+	struct io_stats io;
 
-	hash_for_each(hash_table, bkt, uid_entry, hash) {
-		memset(&uid_entry->io[UID_STATE_TOTAL_CURR], 0,
-			sizeof(struct io_stats));
-		set_io_uid_tasks_zero(uid_entry);
-	}
+	memset(&io, 0, sizeof(struct io_stats));
 
 	rcu_read_lock();
-	do_each_thread(temp, task) {
-		uid = from_kuid_munged(user_ns, task_uid(task));
-		if (!uid_entry || uid_entry->uid != uid)
-			uid_entry = find_or_register_uid(uid);
-		if (!uid_entry)
+	for_each_process(p) {
+		uid_t uid = from_kuid_munged(user_ns, task_uid(p));
+
+		if (uid != uid_entry->uid)
 			continue;
-		add_uid_io_stats(uid_entry, task, UID_STATE_TOTAL_CURR);
-	} while_each_thread(temp, task);
+
+		for_each_thread(p, t) {
+			/* avoid double accounting of dying threads */
+			if (!(t->flags & PF_EXITING)) {
+				io.read_bytes += t->ioac.read_bytes;
+				io.write_bytes += compute_write_bytes(&t->ioac);
+				io.rchar += t->ioac.rchar;
+				io.wchar += t->ioac.wchar;
+				io.fsync += t->ioac.syscfs;
+			}
+		}
+	}
 	rcu_read_unlock();
 
-	hash_for_each(hash_table, bkt, uid_entry, hash) {
-		compute_io_bucket_stats(&uid_entry->io[uid_entry->state],
-					&uid_entry->io[UID_STATE_TOTAL_CURR],
+	compute_io_bucket_stats(&uid_entry->io[uid_entry->state], &io,
 					&uid_entry->io[UID_STATE_TOTAL_LAST],
 					&uid_entry->io[UID_STATE_DEAD_TASKS]);
-		compute_io_uid_tasks(uid_entry);
-	}
 }
-
-static void update_io_stats_uid_locked(struct uid_entry *uid_entry)
-{
-	struct task_struct *task, *temp;
-	struct user_namespace *user_ns = current_user_ns();
-
-	memset(&uid_entry->io[UID_STATE_TOTAL_CURR], 0,
-		sizeof(struct io_stats));
-	set_io_uid_tasks_zero(uid_entry);
-
-	rcu_read_lock();
-	do_each_thread(temp, task) {
-		if (from_kuid_munged(user_ns, task_uid(task)) != uid_entry->uid)
-			continue;
-		add_uid_io_stats(uid_entry, task, UID_STATE_TOTAL_CURR);
-	} while_each_thread(temp, task);
-	rcu_read_unlock();
-
-	compute_io_bucket_stats(&uid_entry->io[uid_entry->state],
-				&uid_entry->io[UID_STATE_TOTAL_CURR],
-				&uid_entry->io[UID_STATE_TOTAL_LAST],
-				&uid_entry->io[UID_STATE_DEAD_TASKS]);
-	compute_io_uid_tasks(uid_entry);
-}
-
 
 static int uid_io_show(struct seq_file *m, void *v)
 {
-	struct uid_entry *uid_entry;
-	unsigned long bkt;
 
-	rt_mutex_lock(&uid_lock);
+	struct uid_entry *uid_entry = NULL;
+	u32 bkt;
 
-	update_io_stats_all_locked();
+	for_each_bkt(bkt) {
+		lock_uid_by_bkt(bkt);
+		for_each_uid_entry(uid_entry, bkt) {
 
-	hash_for_each(hash_table, bkt, uid_entry, hash) {
-		seq_printf(m, "%d %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
+			update_io_stats_uid(uid_entry);
+
+			seq_printf(m, "%d %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
 				uid_entry->uid,
 				uid_entry->io[UID_STATE_FOREGROUND].rchar,
 				uid_entry->io[UID_STATE_FOREGROUND].wchar,
@@ -543,24 +408,23 @@ static int uid_io_show(struct seq_file *m, void *v)
 				uid_entry->io[UID_STATE_BACKGROUND].write_bytes,
 				uid_entry->io[UID_STATE_FOREGROUND].fsync,
 				uid_entry->io[UID_STATE_BACKGROUND].fsync);
-
-		show_io_uid_tasks(m, uid_entry);
+		}
+		unlock_uid_by_bkt(bkt);
 	}
 
-	rt_mutex_unlock(&uid_lock);
 	return 0;
 }
 
 static int uid_io_open(struct inode *inode, struct file *file)
 {
-	return single_open(file, uid_io_show, PDE_DATA(inode));
+	return single_open(file, uid_io_show, pde_data(inode));
 }
 
-static const struct file_operations uid_io_fops = {
-	.open		= uid_io_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
+static const struct proc_ops uid_io_fops = {
+	.proc_open	= uid_io_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
 };
 
 static int uid_procstat_open(struct inode *inode, struct file *file)
@@ -591,33 +455,70 @@ static ssize_t uid_procstat_write(struct file *file,
 	if (state != UID_STATE_BACKGROUND && state != UID_STATE_FOREGROUND)
 		return -EINVAL;
 
-	rt_mutex_lock(&uid_lock);
-
+	lock_uid(uid);
 	uid_entry = find_or_register_uid(uid);
 	if (!uid_entry) {
-		rt_mutex_unlock(&uid_lock);
+		unlock_uid(uid);
 		return -EINVAL;
 	}
 
 	if (uid_entry->state == state) {
-		rt_mutex_unlock(&uid_lock);
+		unlock_uid(uid);
 		return count;
 	}
 
-	update_io_stats_uid_locked(uid_entry);
-
+	update_io_stats_uid(uid_entry);
 	uid_entry->state = state;
-
-	rt_mutex_unlock(&uid_lock);
+	unlock_uid(uid);
 
 	return count;
 }
 
-static const struct file_operations uid_procstat_fops = {
-	.open		= uid_procstat_open,
-	.release	= single_release,
-	.write		= uid_procstat_write,
+static const struct proc_ops uid_procstat_fops = {
+	.proc_open	= uid_procstat_open,
+	.proc_release	= single_release,
+	.proc_write	= uid_procstat_write,
 };
+
+struct update_stats_work {
+	uid_t uid;
+	struct task_io_accounting ioac;
+	u64 utime;
+	u64 stime;
+	struct llist_node node;
+
+	ANDROID_OEM_DATA(1);
+};
+
+static LLIST_HEAD(work_usw);
+
+static void update_stats_workfn(struct work_struct *work)
+{
+	struct update_stats_work *usw, *t;
+	struct uid_entry *uid_entry;
+	struct task_entry *task_entry __maybe_unused;
+	struct llist_node *node;
+
+	node = llist_del_all(&work_usw);
+	llist_for_each_entry_safe(usw, t, node, node) {
+		lock_uid(usw->uid);
+		uid_entry = find_uid_entry(usw->uid);
+		if (!uid_entry)
+			goto next;
+
+		uid_entry->utime += usw->utime;
+		uid_entry->stime += usw->stime;
+		UPDATE_ANDROID_OEM_DATA(OEM_DATA_PTR(uid_entry),
+					OEM_DATA_PTR(usw), NULL, 0);
+
+		__add_uid_io_stats(uid_entry, &usw->ioac, UID_STATE_DEAD_TASKS);
+next:
+		unlock_uid(usw->uid);
+		kfree(usw);
+	}
+
+}
+static DECLARE_WORK(update_stats_work, update_stats_workfn);
 
 static int process_notifier(struct notifier_block *self,
 			unsigned long cmd, void *v)
@@ -630,8 +531,29 @@ static int process_notifier(struct notifier_block *self,
 	if (!task)
 		return NOTIFY_OK;
 
-	rt_mutex_lock(&uid_lock);
 	uid = from_kuid_munged(current_user_ns(), task_uid(task));
+	if (!trylock_uid(uid)) {
+		struct update_stats_work *usw;
+
+		usw = kmalloc(sizeof(struct update_stats_work), GFP_KERNEL);
+		if (usw) {
+			usw->uid = uid;
+			/*
+			 * Copy task->ioac since task might be destroyed before
+			 * the work is later performed.
+			 */
+			usw->ioac = task->ioac;
+			task_cputime_adjusted(task, &usw->utime, &usw->stime);
+#ifdef CONFIG_ANDROID_VENDOR_OEM_DATA
+			usw->android_oem_data1 = 0;
+#endif
+			UPDATE_ANDROID_OEM_DATA(NULL, OEM_DATA_PTR(usw), task, 1);
+			llist_add(&usw->node, &work_usw);
+			schedule_work(&update_stats_work);
+		}
+		return NOTIFY_OK;
+	}
+
 	uid_entry = find_or_register_uid(uid);
 	if (!uid_entry) {
 		pr_err("%s: failed to find uid %d\n", __func__, uid);
@@ -641,11 +563,12 @@ static int process_notifier(struct notifier_block *self,
 	task_cputime_adjusted(task, &utime, &stime);
 	uid_entry->utime += utime;
 	uid_entry->stime += stime;
+	UPDATE_ANDROID_OEM_DATA(OEM_DATA_PTR(uid_entry), NULL, task, 2);
 
 	add_uid_io_stats(uid_entry, task, UID_STATE_DEAD_TASKS);
 
 exit:
-	rt_mutex_unlock(&uid_lock);
+	unlock_uid(uid);
 	return NOTIFY_OK;
 }
 
@@ -655,7 +578,7 @@ static struct notifier_block process_notifier_block = {
 
 static int __init proc_uid_sys_stats_init(void)
 {
-	hash_init(hash_table);
+	init_hash_table_and_lock();
 
 	cpu_parent = proc_mkdir("uid_cputime", NULL);
 	if (!cpu_parent) {

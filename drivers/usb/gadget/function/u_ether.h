@@ -1,14 +1,10 @@
+/* SPDX-License-Identifier: GPL-2.0+ */
 /*
  * u_ether.h -- interface to USB gadget "ethernet link" utilities
  *
  * Copyright (C) 2003-2005,2008 David Brownell
  * Copyright (C) 2003-2004 Robert Schwebel, Benedikt Spranger
  * Copyright (C) 2008 Nokia Corporation
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
  */
 
 #ifndef __U_ETHER_H
@@ -20,7 +16,7 @@
 #include <linux/usb/cdc.h>
 #include <linux/netdevice.h>
 
-#define QMULT_DEFAULT 20
+#define QMULT_DEFAULT 5
 
 /*
  * dev_addr: initial value
@@ -73,10 +69,6 @@ struct gether {
 	bool				is_fixed;
 	u32				fixed_out_len;
 	u32				fixed_in_len;
-	u32				ul_max_pkts_per_xfer;
-	u32				dl_max_pkts_per_xfer;
-	u32				dl_max_xfer_size;
-	bool				multi_pkt_xfer;
 	bool				supports_multi_frame;
 	struct sk_buff			*(*wrap)(struct gether *port,
 						struct sk_buff *skb);
@@ -87,7 +79,7 @@ struct gether {
 	/* called on network open/close */
 	void				(*open)(struct gether *);
 	void				(*close)(struct gether *);
-	struct rndis_packet_msg_type	*header;
+	bool				is_suspend;
 };
 
 #define	DEFAULT_FILTER	(USB_CDC_PACKET_TYPE_BROADCAST \
@@ -157,6 +149,32 @@ static inline struct net_device *gether_setup_default(void)
  * This associates one ethernet-over-usb link with a gadget.
  */
 void gether_set_gadget(struct net_device *net, struct usb_gadget *g);
+
+/**
+ * gether_attach_gadget - Reparent net_device to the gadget device.
+ * @net: The network device to reparent.
+ * @g: The target USB gadget device to parent to.
+ *
+ * This function moves the network device to be a child of the USB gadget
+ * device in the device hierarchy. This is typically done when the function
+ * is bound to a configuration.
+ *
+ * Returns 0 on success, or a negative error code on failure.
+ */
+int gether_attach_gadget(struct net_device *net, struct usb_gadget *g);
+
+/**
+ * gether_detach_gadget - Detach net_device from its gadget parent.
+ * @net: The network device to detach.
+ *
+ * This function moves the network device to be a child of the virtual
+ * devices parent, effectively detaching it from the USB gadget device
+ * hierarchy. This is typically done when the function is unbound
+ * from a configuration but the instance is not yet freed.
+ */
+void gether_detach_gadget(struct net_device *net);
+
+DEFINE_FREE(detach_gadget, struct net_device *, if (_T) gether_detach_gadget(_T))
 
 /**
  * gether_set_dev_addr - initialize an ethernet-over-usb link with eth address
@@ -253,14 +271,27 @@ unsigned gether_get_qmult(struct net_device *net);
  */
 int gether_get_ifname(struct net_device *net, char *name, int len);
 
+/**
+ * gether_set_ifname - set an ethernet-over-usb link interface name
+ * @net: device representing this link
+ * @name: new interface name
+ * @len: length of @name
+ *
+ * This sets the interface name of this ethernet-over-usb link.
+ * A single terminating newline, if any, is ignored.
+ * Returns zero on success, else negative errno.
+ */
+int gether_set_ifname(struct net_device *net, const char *name, int len);
+
 void gether_cleanup(struct eth_dev *dev);
+
+void gether_suspend(struct gether *link);
+void gether_resume(struct gether *link);
 
 /* connect/disconnect is handled by individual functions */
 struct net_device *gether_connect(struct gether *);
 void gether_disconnect(struct gether *);
-void gether_update_dl_max_pkts_per_xfer(struct gether *link, u32 n);
-void gether_update_dl_max_xfer_size(struct gether *link, u32 s);
-void gether_enable_sg(struct gether *link, bool);
+
 /* Some controllers can't support CDC Ethernet (ECM) ... */
 static inline bool can_support_ecm(struct usb_gadget *gadget)
 {
@@ -272,6 +303,19 @@ static inline bool can_support_ecm(struct usb_gadget *gadget)
 	 * your controller.  Add it above if it can't handle CDC.
 	 */
 	return true;
+}
+
+/* peak (theoretical) bulk transfer rate in bits-per-second */
+static inline unsigned int gether_bitrate(struct usb_gadget *g)
+{
+	if (g->speed >= USB_SPEED_SUPER_PLUS)
+		return 4250000000U;
+	if (g->speed == USB_SPEED_SUPER)
+		return 3750000000U;
+	else if (g->speed == USB_SPEED_HIGH)
+		return 13 * 512 * 8 * 1000 * 8;
+	else
+		return 19 * 64 * 1 * 1000 * 8;
 }
 
 #endif /* __U_ETHER_H */

@@ -4,26 +4,17 @@
 #include <linux/leds.h>
 #include <linux/module.h>
 #include <linux/of.h>
-#include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
-#include <uapi/linux/uleds.h>
 
 /* PMIC global control register definition */
-#define SC2731_MODULE_EN0	0xc08
-#define SC2731_CLK_EN0		0xc18
-#define SC2731_RGB_CTRL		0xebc
-#define SC2730_MODULE_EN0       0x1808
-#define SC2730_CLK_EN0          0x1810
-#define SC2730_RGB_CTRL         0
-#define SC2721_MODULE_EN0       0xc08
-#define SC2721_CLK_EN0          0xc10
-#define SC2721_RGB_CTRL         0xea0
+#define SC27XX_MODULE_EN0	0xc08
+#define SC27XX_CLK_EN0		0xc18
+#define SC27XX_RGB_CTRL		0xebc
 
 #define SC27XX_BLTC_EN		BIT(9)
 #define SC27XX_RTC_EN		BIT(7)
 #define SC27XX_RGB_PD		BIT(0)
-#define SC2730_RGB_PD		BIT(12)
 
 /* Breathing light controller register definition */
 #define SC27XX_LEDS_CTRL	0x00
@@ -54,7 +45,7 @@
 #define SC27XX_DELTA_T_MAX	(SC27XX_LEDS_STEP * 255)
 
 struct sc27xx_led {
-	char name[LED_MAX_NAME_SIZE];
+	struct fwnode_handle *fwnode;
 	struct led_classdev ldev;
 	struct sc27xx_led_priv *priv;
 	u8 line;
@@ -68,53 +59,24 @@ struct sc27xx_led_priv {
 	u32 base;
 };
 
-struct sc27xx_led_data {
-	u32 module_en;
-	u32 clk_en;
-	u32 rgb_ctrl;
-};
-
-static const struct sc27xx_led_data sc2731_data = {
-	.module_en = SC2731_MODULE_EN0,
-	.clk_en = SC2731_CLK_EN0,
-	.rgb_ctrl = SC2731_RGB_CTRL,
-};
-
-static const struct sc27xx_led_data sc2730_data = {
-	.module_en = SC2730_MODULE_EN0,
-	.clk_en = SC2730_CLK_EN0,
-	.rgb_ctrl = SC2730_RGB_CTRL,
-};
-
-static const struct sc27xx_led_data sc2721_data = {
-	.module_en = SC2721_MODULE_EN0,
-	.clk_en = SC2721_CLK_EN0,
-	.rgb_ctrl = SC2721_RGB_CTRL,
-};
-
 #define to_sc27xx_led(ldev) \
 	container_of(ldev, struct sc27xx_led, ldev)
 
-static int sc27xx_led_init(struct sc27xx_led_priv *priv, const struct sc27xx_led_data *data)
+static int sc27xx_led_init(struct regmap *regmap)
 {
 	int err;
-	struct regmap *regmap = priv->regmap;
-	u32 ctrl_base = priv->base + SC27XX_LEDS_CTRL;
 
-	err = regmap_update_bits(regmap, data->module_en, SC27XX_BLTC_EN,
+	err = regmap_update_bits(regmap, SC27XX_MODULE_EN0, SC27XX_BLTC_EN,
 				 SC27XX_BLTC_EN);
 	if (err)
 		return err;
 
-	err = regmap_update_bits(regmap, data->clk_en, SC27XX_RTC_EN,
+	err = regmap_update_bits(regmap, SC27XX_CLK_EN0, SC27XX_RTC_EN,
 				 SC27XX_RTC_EN);
 	if (err)
 		return err;
 
-	if (!data->rgb_ctrl)
-		return regmap_update_bits(regmap, ctrl_base, SC2730_RGB_PD, 0);
-
-	return regmap_update_bits(regmap, data->rgb_ctrl, SC27XX_RGB_PD, 0);
+	return regmap_update_bits(regmap, SC27XX_RGB_CTRL, SC27XX_RGB_PD, 0);
 }
 
 static u32 sc27xx_led_get_offset(struct sc27xx_led *leds)
@@ -276,30 +238,34 @@ out:
 	return err;
 }
 
-static int sc27xx_led_register(struct device *dev, struct sc27xx_led_priv *priv,
-				const struct sc27xx_led_data *data)
+static int sc27xx_led_register(struct device *dev, struct sc27xx_led_priv *priv)
 {
 	int i, err;
 
-	err = sc27xx_led_init(priv, data);
+	err = sc27xx_led_init(priv->regmap);
 	if (err)
 		return err;
 
 	for (i = 0; i < SC27XX_LEDS_MAX; i++) {
 		struct sc27xx_led *led = &priv->leds[i];
+		struct led_init_data init_data = {};
 
 		if (!led->active)
 			continue;
 
 		led->line = i;
 		led->priv = priv;
-		led->ldev.name = led->name;
 		led->ldev.brightness_set_blocking = sc27xx_led_set;
 		led->ldev.pattern_set = sc27xx_led_pattern_set;
 		led->ldev.pattern_clear = sc27xx_led_pattern_clear;
 		led->ldev.default_trigger = "pattern";
 
-		err = devm_led_classdev_register(dev, &led->ldev);
+		init_data.fwnode = led->fwnode;
+		init_data.devicename = "sc27xx";
+		init_data.default_label = ":";
+
+		err = devm_led_classdev_register_ext(dev, &led->ldev,
+						     &init_data);
 		if (err)
 			return err;
 	}
@@ -310,20 +276,12 @@ static int sc27xx_led_register(struct device *dev, struct sc27xx_led_priv *priv,
 static int sc27xx_led_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	const struct sc27xx_led_data *data;
-	struct device_node *np = dev->of_node, *child;
+	struct device_node *np = dev_of_node(dev);
 	struct sc27xx_led_priv *priv;
-	const char *str;
 	u32 base, count, reg;
 	int err;
 
-	data = of_device_get_match_data(dev);
-	if (!data) {
-		dev_err(dev, "no matching driver data found\n");
-		return -EINVAL;
-	}
-
-	count = of_get_child_count(np);
+	count = of_get_available_child_count(np);
 	if (!count || count > SC27XX_LEDS_MAX)
 		return -EINVAL;
 
@@ -338,7 +296,6 @@ static int sc27xx_led_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	platform_set_drvdata(pdev, priv);
-	mutex_init(&priv->lock);
 	priv->base = base;
 	priv->regmap = dev_get_regmap(dev->parent, NULL);
 	if (!priv->regmap) {
@@ -347,50 +304,36 @@ static int sc27xx_led_probe(struct platform_device *pdev)
 		return err;
 	}
 
-	for_each_child_of_node(np, child) {
+	for_each_available_child_of_node_scoped(np, child) {
 		err = of_property_read_u32(child, "reg", &reg);
-		if (err) {
-			of_node_put(child);
-			mutex_destroy(&priv->lock);
-			return err;
-		}
-
-		if (reg >= SC27XX_LEDS_MAX || priv->leds[reg].active) {
-			of_node_put(child);
-			mutex_destroy(&priv->lock);
-			return -EINVAL;
-		}
-
-		priv->leds[reg].active = true;
-
-		err = of_property_read_string(child, "label", &str);
 		if (err)
-			snprintf(priv->leds[reg].name, LED_MAX_NAME_SIZE,
-				 "sc27xx::");
-		else
-			snprintf(priv->leds[reg].name, LED_MAX_NAME_SIZE,
-				 "sc27xx:%s", str);
+			return err;
+
+		if (reg >= SC27XX_LEDS_MAX || priv->leds[reg].active)
+			return -EINVAL;
+
+		priv->leds[reg].fwnode = of_fwnode_handle(child);
+		priv->leds[reg].active = true;
 	}
 
-	err = sc27xx_led_register(dev, priv, data);
+	mutex_init(&priv->lock);
+
+	err = sc27xx_led_register(dev, priv);
 	if (err)
 		mutex_destroy(&priv->lock);
 
 	return err;
 }
 
-static int sc27xx_led_remove(struct platform_device *pdev)
+static void sc27xx_led_remove(struct platform_device *pdev)
 {
 	struct sc27xx_led_priv *priv = platform_get_drvdata(pdev);
 
 	mutex_destroy(&priv->lock);
-	return 0;
 }
 
 static const struct of_device_id sc27xx_led_of_match[] = {
-	{ .compatible = "sprd,sc2731-bltc", .data = &sc2731_data },
-	{ .compatible = "sprd,sc2730-bltc", .data = &sc2730_data },
-	{ .compatible = "sprd,sc2721-bltc", .data = &sc2721_data },
+	{ .compatible = "sprd,sc2731-bltc", },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, sc27xx_led_of_match);
@@ -401,7 +344,7 @@ static struct platform_driver sc27xx_led_driver = {
 		.of_match_table = sc27xx_led_of_match,
 	},
 	.probe = sc27xx_led_probe,
-	.remove = sc27xx_led_remove,
+	.remove_new = sc27xx_led_remove,
 };
 
 module_platform_driver(sc27xx_led_driver);

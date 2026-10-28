@@ -1,5 +1,8 @@
-obj-$(CONFIG_EXFAT_FS) += exfat_core.o exfat_fs.o
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Makefile for the linux exFAT filesystem support.
+#
+obj-$(CONFIG_EXFAT_FS) += exfat.o
 
-exfat_fs-y := exfat_super.o
-exfat_core-y := exfat.o exfat_api.o exfat_blkdev.o exfat_cache.o exfat_xattr.o \
-		exfat_data.o exfat_global.o exfat_nls.o exfat_oal.o exfat_upcase.o
+exfat-y	:= inode.o namei.o dir.o super.o fatent.o cache.o nls.o misc.o \
+	   file.o balloc.o

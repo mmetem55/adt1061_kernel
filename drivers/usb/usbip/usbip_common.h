@@ -1,22 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0+
 /*
  * Copyright (C) 2003-2008 Takahiro Hirofuchi
  * Copyright (C) 2015-2016 Samsung Electronics
  *               Krzysztof Opasiak <k.opasiak@samsung.com>
- *
- * This is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307,
- * USA.
  */
 
 #ifndef __USBIP_COMMON_H
@@ -32,6 +18,7 @@
 #include <linux/usb.h>
 #include <linux/wait.h>
 #include <linux/sched/task.h>
+#include <linux/kcov.h>
 #include <uapi/linux/usbip.h>
 
 #undef pr_fmt
@@ -277,6 +264,9 @@ struct usbip_device {
 	/* lock for status */
 	spinlock_t lock;
 
+	/* mutex for synchronizing sysfs store paths */
+	struct mutex sysfs_lock;
+
 	int sockfd;
 	struct socket *tcp_socket;
 
@@ -291,6 +281,10 @@ struct usbip_device {
 		void (*reset)(struct usbip_device *);
 		void (*unusable)(struct usbip_device *);
 	} eh_ops;
+
+#ifdef CONFIG_KCOV
+	u64 kcov_handle;
+#endif
 };
 
 #define kthread_get_run(threadfn, data, namefmt, ...)			   \
@@ -303,12 +297,6 @@ struct usbip_device {
 	}								   \
 	__k;								   \
 })
-
-#define kthread_stop_put(k)		\
-	do {				\
-		kthread_stop(k);	\
-		put_task_struct(k);	\
-	} while (0)
 
 /* usbip_common.c */
 void usbip_dump_urb(struct urb *purb);
@@ -350,5 +338,30 @@ static inline int interface_to_devnum(struct usb_interface *interface)
 
 	return udev->devnum;
 }
+
+#ifdef CONFIG_KCOV
+
+static inline void usbip_kcov_handle_init(struct usbip_device *ud)
+{
+	ud->kcov_handle = kcov_common_handle();
+}
+
+static inline void usbip_kcov_remote_start(struct usbip_device *ud)
+{
+	kcov_remote_start_common(ud->kcov_handle);
+}
+
+static inline void usbip_kcov_remote_stop(void)
+{
+	kcov_remote_stop();
+}
+
+#else /* CONFIG_KCOV */
+
+static inline void usbip_kcov_handle_init(struct usbip_device *ud) { }
+static inline void usbip_kcov_remote_start(struct usbip_device *ud) { }
+static inline void usbip_kcov_remote_stop(void) { }
+
+#endif /* CONFIG_KCOV */
 
 #endif /* __USBIP_COMMON_H */

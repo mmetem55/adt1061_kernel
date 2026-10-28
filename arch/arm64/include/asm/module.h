@@ -1,28 +1,60 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (C) 2012 ARM Ltd.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 #ifndef __ASM_MODULE_H
 #define __ASM_MODULE_H
 
 #include <asm-generic/module.h>
 
-#define MODULE_ARCH_VERMAGIC	"aarch64"
+#ifdef CONFIG_KVM
+struct pkvm_module_section {
+	void *start;
+	void *end;
+};
 
-#ifdef CONFIG_ARM64_MODULE_PLTS
+typedef s32 kvm_nvhe_reloc_t;
+struct pkvm_module_ops;
+
+struct pkvm_el2_sym {
+	char			*name;
+	__le32			*rela_pos;
+	struct list_head	node;
+};
+
+struct pkvm_el2_module {
+	struct pkvm_module_section text;
+	struct pkvm_module_section bss;
+	struct pkvm_module_section rodata;
+	struct pkvm_module_section data;
+	struct pkvm_module_section event_ids;
+	struct pkvm_module_section patchable_function_entries;
+	struct pkvm_module_section sections;
+	void *hyp_va;
+	struct hyp_event *hyp_events;
+	struct hyp_printk_fmt *hyp_printk_fmts;
+	unsigned int nr_hyp_events;
+	unsigned int nr_hyp_printk_fmts;
+	kvm_nvhe_reloc_t *relocs;
+	struct list_head node;
+	struct list_head ext_symbols;
+	unsigned int nr_relocs;
+	int (*init)(const struct pkvm_module_ops *ops);
+};
+
+void kvm_apply_hyp_module_relocations(struct pkvm_el2_module *mod,
+				      kvm_nvhe_reloc_t *begin,
+				      kvm_nvhe_reloc_t *end);
+
+#define ARM64_MODULE_KVM_ARCHDATA					\
+	/* For pKVM hypervisor modules */				\
+	struct pkvm_el2_module	hyp;
+#else
+#define ARM64_MODULE_KVM_ARCHDATA
+#endif
+
 struct mod_plt_sec {
-	struct elf64_shdr	*plt;
+	int			plt_shndx;
 	int			plt_num_entries;
 	int			plt_max_entries;
 };
@@ -32,18 +64,17 @@ struct mod_arch_specific {
 	struct mod_plt_sec	init;
 
 	/* for CONFIG_DYNAMIC_FTRACE */
-	struct plt_entry 	*ftrace_trampoline;
-};
-#endif
+	struct plt_entry	*ftrace_trampolines;
 
-u64 module_emit_plt_entry(struct module *mod, void *loc, const Elf64_Rela *rela,
+	ARM64_MODULE_KVM_ARCHDATA
+};
+
+u64 module_emit_plt_entry(struct module *mod, Elf64_Shdr *sechdrs,
+			  void *loc, const Elf64_Rela *rela,
 			  Elf64_Sym *sym);
 
-#ifdef CONFIG_RANDOMIZE_BASE
-extern u64 module_alloc_base;
-#else
-#define module_alloc_base	((u64)_etext - MODULES_VSIZE)
-#endif
+u64 module_emit_veneer_for_adrp(struct module *mod, Elf64_Shdr *sechdrs,
+				void *loc, u64 val);
 
 struct plt_entry {
 	/*
@@ -54,39 +85,32 @@ struct plt_entry {
 	 * is exactly what we are dealing with here, we are free to use x16
 	 * as a scratch register in the PLT veneers.
 	 */
-	__le32	mov0;	/* movn	x16, #0x....			*/
-	__le32	mov1;	/* movk	x16, #0x...., lsl #16		*/
-	__le32	mov2;	/* movk	x16, #0x...., lsl #32		*/
+	__le32	adrp;	/* adrp	x16, ....			*/
+	__le32	add;	/* add	x16, x16, #0x....		*/
 	__le32	br;	/* br	x16				*/
 };
 
-static inline struct plt_entry get_plt_entry(u64 val)
+static inline bool is_forbidden_offset_for_adrp(void *place)
 {
-	/*
-	 * MOVK/MOVN/MOVZ opcode:
-	 * +--------+------------+--------+-----------+-------------+---------+
-	 * | sf[31] | opc[30:29] | 100101 | hw[22:21] | imm16[20:5] | Rd[4:0] |
-	 * +--------+------------+--------+-----------+-------------+---------+
-	 *
-	 * Rd     := 0x10 (x16)
-	 * hw     := 0b00 (no shift), 0b01 (lsl #16), 0b10 (lsl #32)
-	 * opc    := 0b11 (MOVK), 0b00 (MOVN), 0b10 (MOVZ)
-	 * sf     := 1 (64-bit variant)
-	 */
-	return (struct plt_entry){
-		cpu_to_le32(0x92800010 | (((~val      ) & 0xffff)) << 5),
-		cpu_to_le32(0xf2a00010 | ((( val >> 16) & 0xffff)) << 5),
-		cpu_to_le32(0xf2c00010 | ((( val >> 32) & 0xffff)) << 5),
-		cpu_to_le32(0xd61f0200)
-	};
+	return cpus_have_final_cap(ARM64_WORKAROUND_843419) &&
+	       ((u64)place & 0xfff) >= 0xff8;
 }
 
-static inline bool plt_entries_equal(const struct plt_entry *a,
-				     const struct plt_entry *b)
+struct plt_entry get_plt_entry(u64 dst, void *pc);
+
+static inline const Elf_Shdr *find_section(const Elf_Ehdr *hdr,
+				    const Elf_Shdr *sechdrs,
+				    const char *name)
 {
-	return a->mov0 == b->mov0 &&
-	       a->mov1 == b->mov1 &&
-	       a->mov2 == b->mov2;
+	const Elf_Shdr *s, *se;
+	const char *secstrs = (void *)hdr + sechdrs[hdr->e_shstrndx].sh_offset;
+
+	for (s = sechdrs, se = sechdrs + hdr->e_shnum; s < se; s++) {
+		if (strcmp(name, secstrs + s->sh_name) == 0)
+			return s;
+	}
+
+	return NULL;
 }
 
 #endif /* __ASM_MODULE_H */

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * This file contains the major functions in WLAN
  * driver. It includes init, exit, open, close and main
@@ -38,8 +39,7 @@ unsigned int lbs_debug;
 EXPORT_SYMBOL_GPL(lbs_debug);
 module_param_named(libertas_debug, lbs_debug, int, 0644);
 
-unsigned int lbs_disablemesh;
-EXPORT_SYMBOL_GPL(lbs_disablemesh);
+static unsigned int lbs_disablemesh;
 module_param_named(libertas_disablemesh, lbs_disablemesh, int, 0644);
 
 
@@ -216,7 +216,7 @@ int lbs_stop_iface(struct lbs_private *priv)
 
 	spin_lock_irqsave(&priv->driver_lock, flags);
 	priv->iface_running = false;
-	kfree_skb(priv->currenttxskb);
+	dev_kfree_skb_irq(priv->currenttxskb);
 	priv->currenttxskb = NULL;
 	priv->tx_pending_len = 0;
 	spin_unlock_irqrestore(&priv->driver_lock, flags);
@@ -301,9 +301,9 @@ int lbs_set_mac_address(struct net_device *dev, void *addr)
 	dev = priv->dev;
 
 	memcpy(priv->current_addr, phwaddr->sa_data, ETH_ALEN);
-	memcpy(dev->dev_addr, phwaddr->sa_data, ETH_ALEN);
+	eth_hw_addr_set(dev, phwaddr->sa_data);
 	if (priv->mesh_dev)
-		memcpy(priv->mesh_dev->dev_addr, phwaddr->sa_data, ETH_ALEN);
+		eth_hw_addr_set(priv->mesh_dev, phwaddr->sa_data);
 
 	return ret;
 }
@@ -720,11 +720,11 @@ EXPORT_SYMBOL_GPL(lbs_resume);
  * lbs_cmd_timeout_handler - handles the timeout of command sending.
  * It will re-send the same command again.
  *
- * @data: &struct lbs_private pointer
+ * @t: Context from which to retrieve a &struct lbs_private pointer
  */
-static void lbs_cmd_timeout_handler(unsigned long data)
+static void lbs_cmd_timeout_handler(struct timer_list *t)
 {
-	struct lbs_private *priv = (struct lbs_private *)data;
+	struct lbs_private *priv = from_timer(priv, t, command_timer);
 	unsigned long flags;
 
 	spin_lock_irqsave(&priv->driver_lock, flags);
@@ -754,11 +754,11 @@ out:
  * to the hardware. This is known to frequently happen with SD8686 when
  * waking up after a Wake-on-WLAN-triggered resume.
  *
- * @data: &struct lbs_private pointer
+ * @t: Context from which to retrieve a &struct lbs_private pointer
  */
-static void lbs_tx_lockup_handler(unsigned long data)
+static void lbs_tx_lockup_handler(struct timer_list *t)
 {
-	struct lbs_private *priv = (struct lbs_private *)data;
+	struct lbs_private *priv = from_timer(priv, t, tx_lockup_timer);
 	unsigned long flags;
 
 	spin_lock_irqsave(&priv->driver_lock, flags);
@@ -776,12 +776,12 @@ static void lbs_tx_lockup_handler(unsigned long data)
 /**
  * auto_deepsleep_timer_fn - put the device back to deep sleep mode when
  * timer expires and no activity (command, event, data etc.) is detected.
- * @data:	&struct lbs_private pointer
+ * @t: Context from which to retrieve a &struct lbs_private pointer
  * returns:	N/A
  */
-static void auto_deepsleep_timer_fn(unsigned long data)
+static void auto_deepsleep_timer_fn(struct timer_list *t)
 {
-	struct lbs_private *priv = (struct lbs_private *)data;
+	struct lbs_private *priv = from_timer(priv, t, auto_deepsleep_timer);
 
 	if (priv->is_activity_detected) {
 		priv->is_activity_detected = 0;
@@ -847,12 +847,9 @@ static int lbs_init_adapter(struct lbs_private *priv)
 	init_waitqueue_head(&priv->fw_waitq);
 	mutex_init(&priv->lock);
 
-	setup_timer(&priv->command_timer, lbs_cmd_timeout_handler,
-		(unsigned long)priv);
-	setup_timer(&priv->tx_lockup_timer, lbs_tx_lockup_handler,
-		(unsigned long)priv);
-	setup_timer(&priv->auto_deepsleep_timer, auto_deepsleep_timer_fn,
-			(unsigned long)priv);
+	timer_setup(&priv->command_timer, lbs_cmd_timeout_handler, 0);
+	timer_setup(&priv->tx_lockup_timer, lbs_tx_lockup_handler, 0);
+	timer_setup(&priv->auto_deepsleep_timer, auto_deepsleep_timer_fn, 0);
 
 	INIT_LIST_HEAD(&priv->cmdfreeq);
 	INIT_LIST_HEAD(&priv->cmdpendingq);
@@ -872,6 +869,7 @@ static int lbs_init_adapter(struct lbs_private *priv)
 	ret = kfifo_alloc(&priv->event_fifo, sizeof(u32) * 16, GFP_KERNEL);
 	if (ret) {
 		pr_err("Out of memory allocating event FIFO buffer\n");
+		lbs_free_cmd_buffer(priv);
 		goto out;
 	}
 
@@ -883,8 +881,8 @@ static void lbs_free_adapter(struct lbs_private *priv)
 {
 	lbs_free_cmd_buffer(priv);
 	kfifo_free(&priv->event_fifo);
-	del_timer(&priv->command_timer);
-	del_timer(&priv->tx_lockup_timer);
+	timer_delete_sync(&priv->command_timer);
+	timer_delete_sync(&priv->tx_lockup_timer);
 	del_timer(&priv->auto_deepsleep_timer);
 }
 
@@ -910,25 +908,29 @@ struct lbs_private *lbs_add_card(void *card, struct device *dmdev)
 	struct net_device *dev;
 	struct wireless_dev *wdev;
 	struct lbs_private *priv = NULL;
+	int err;
 
 	/* Allocate an Ethernet device and register it */
 	wdev = lbs_cfg_alloc(dmdev);
 	if (IS_ERR(wdev)) {
+		err = PTR_ERR(wdev);
 		pr_err("cfg80211 init failed\n");
-		goto done;
+		goto err_cfg;
 	}
 
 	wdev->iftype = NL80211_IFTYPE_STATION;
 	priv = wdev_priv(wdev);
 	priv->wdev = wdev;
 
-	if (lbs_init_adapter(priv)) {
+	err = lbs_init_adapter(priv);
+	if (err) {
 		pr_err("failed to initialize adapter structure\n");
 		goto err_wdev;
 	}
 
 	dev = alloc_netdev(0, "wlan%d", NET_NAME_UNKNOWN, ether_setup);
 	if (!dev) {
+		err = -ENOMEM;
 		dev_err(dmdev, "no memory for network device instance\n");
 		goto err_adapter;
 	}
@@ -939,7 +941,7 @@ struct lbs_private *lbs_add_card(void *card, struct device *dmdev)
 	wdev->netdev = dev;
 	priv->dev = dev;
 
- 	dev->netdev_ops = &lbs_netdev_ops;
+	dev->netdev_ops = &lbs_netdev_ops;
 	dev->watchdog_timeo = 5 * HZ;
 	dev->ethtool_ops = &lbs_ethtool_ops;
 	dev->flags |= IFF_BROADCAST | IFF_MULTICAST;
@@ -952,6 +954,7 @@ struct lbs_private *lbs_add_card(void *card, struct device *dmdev)
 	init_waitqueue_head(&priv->waitq);
 	priv->main_thread = kthread_run(lbs_thread, dev, "lbs_main");
 	if (IS_ERR(priv->main_thread)) {
+		err = PTR_ERR(priv->main_thread);
 		lbs_deb_thread("Error creating main thread.\n");
 		goto err_ndev;
 	}
@@ -964,7 +967,7 @@ struct lbs_private *lbs_add_card(void *card, struct device *dmdev)
 	priv->wol_gap = 20;
 	priv->ehs_remove_supported = true;
 
-	goto done;
+	return priv;
 
  err_ndev:
 	free_netdev(dev);
@@ -975,10 +978,8 @@ struct lbs_private *lbs_add_card(void *card, struct device *dmdev)
  err_wdev:
 	lbs_cfg_free(priv);
 
-	priv = NULL;
-
-done:
-	return priv;
+ err_cfg:
+	return ERR_PTR(err);
 }
 EXPORT_SYMBOL_GPL(lbs_add_card);
 
@@ -1045,7 +1046,7 @@ int lbs_rtap_supported(struct lbs_private *priv)
 int lbs_start_card(struct lbs_private *priv)
 {
 	struct net_device *dev = priv->dev;
-	int ret = -1;
+	int ret;
 
 	/* poke the firmware */
 	ret = lbs_setup_firmware(priv);

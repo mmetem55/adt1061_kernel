@@ -1,0 +1,472 @@
+// SPDX-License-Identifier: GPL-2.0
+//
+// Spreadtrum clock infrastructure
+//
+// Copyright (C) 2017 Spreadtrum, Inc.
+// Author: Chunyan Zhang <chunyan.zhang@spreadtrum.com>
+
+#include <linux/clk.h>
+#include <linux/delay.h>
+#include <linux/mfd/syscon.h>
+#include <linux/module.h>
+#include <linux/of.h>
+#include <linux/of_address.h>
+#include <linux/of_platform.h>
+#include <linux/platform_device.h>
+#include <linux/regmap.h>
+
+#include "common.h"
+
+/*
+ * ROOT CAUSE FIX, part 2 (real board DTS confirmed, 2026-10-20):
+ * sprd_clk_probe() used to look up the "enable"/"power" syscon switches
+ * with syscon_regmap_lookup_by_phandle_args(node, "enable"/"power", 2,
+ * ...), which expects a literal DT property named exactly "enable" or
+ * "power" (phandle + 2 args). This board's actual DTS (aidata-ums512.dtsi)
+ * never uses that form - every clk-provider node that needs this (gpu-clk,
+ * mm-gate-clk, ...) instead uses the generic indexed-list convention also
+ * seen elsewhere in the same file (e.g. &sdio0's "syscons"/"syscon-names"):
+ *
+ *   gpu-clk {
+ *       syscons = <&aon_apb_regs REG... MASK...>, <&pmu_apb_regs REG... MASK...>;
+ *       syscon-names = "enable", "power";
+ *   };
+ *
+ * i.e. one "syscons" property holding a list of <phandle reg mask> triplets,
+ * matched by name via a sibling "syscon-names" string list - the same
+ * pattern "clocks"/"clock-names" or "interrupts"/"interrupt-names" use, just
+ * for syscon phandles. of_parse_phandle_with_fixed_args() is the right
+ * generic-OF call for "a list of phandle + N fixed args, indexed", since it
+ * doesn't rely on the *target* node (aon_apb_regs/pmu_apb_regs) declaring
+ * its own "#syscon-cells" - we already know each entry is phandle + 2 args
+ * (reg, mask) from this driver's own convention.
+ *
+ * Confirmed on real hardware that the old "enable"/"power" literal-property
+ * lookup always silently failed (IS_ERR) for the GPU clk node, meaning its
+ * GPU_TOP AHB/APB bridge enable bit and PD_GPU_TOP_FORCE_SHUTDOWN bit were
+ * never actually being touched - sprd_clk_probe() registered the GPU gates
+ * against a completely unpowered register block, which is what aborted.
+ */
+static struct regmap *sprd_syscon_get_regmap_by_name(struct device_node *node,
+						       const char *name,
+						       u32 *reg, u32 *mask)
+{
+	struct of_phandle_args out_args = { 0 };
+	struct regmap *regmap;
+	int index;
+	int ret;
+
+	index = of_property_match_string(node, "syscon-names", name);
+	if (index < 0)
+		return ERR_PTR(index);
+
+	ret = of_parse_phandle_with_fixed_args(node, "syscons", 2, index,
+						&out_args);
+	if (ret)
+		return ERR_PTR(ret);
+
+	regmap = syscon_node_to_regmap(out_args.np);
+	of_node_put(out_args.np);
+	if (IS_ERR(regmap))
+		return regmap;
+
+	*reg = out_args.args[0];
+	*mask = out_args.args[1];
+
+	return regmap;
+}
+
+static const struct regmap_config sprdclk_regmap_config = {
+	.reg_bits	= 32,
+	.reg_stride	= 4,
+	.val_bits	= 32,
+	.max_register	= 0xffff,
+	.fast_io	= true,
+};
+
+/*
+ * sprd_sip_svc_get_handle() is exported by sprd_sip_fw.ko, which sprd_clk.ko
+ * now depends on. A __weak stub here does not get overridden by another module
+ * and always made the "sprd,sec-clk" clock nodes fail with "failed to get svc
+ * handle".
+ */
+
+static void sprd_clk_sec_set_svc_handle(const struct sprd_clk_desc *desc,
+				struct sprd_sip_svc_handle *svc_handle)
+{
+	int i;
+	struct sprd_clk_common *sclk;
+
+	for (i = 0; i < desc->num_clk_clks; i++) {
+		sclk = desc->clk_clks[i];
+		if (!sclk)
+			continue;
+
+		sclk->svc_handle = svc_handle;
+	}
+}
+
+static void sprd_clk_set_regmap(const struct sprd_clk_desc *desc,
+			 struct regmap *regmap)
+{
+	int i;
+	struct sprd_clk_common *cclk;
+
+	for (i = 0; i < desc->num_clk_clks; i++) {
+		cclk = desc->clk_clks[i];
+		if (!cclk)
+			continue;
+
+		cclk->regmap = regmap;
+	}
+}
+
+int sprd_clk_regmap_init(struct platform_device *pdev,
+			 const struct sprd_clk_desc *desc)
+{
+	void __iomem *base;
+	struct device_node *node = pdev->dev.of_node;
+	struct regmap *regmap;
+	struct sprd_sip_svc_handle *svc_handle;
+	struct resource *res;
+
+	if (of_find_property(node, "sprd,syscon", NULL)) {
+		regmap = syscon_regmap_lookup_by_phandle(node, "sprd,syscon");
+		if (IS_ERR_OR_NULL(regmap)) {
+			pr_err("%s: failed to get syscon regmap\n", __func__);
+			return PTR_ERR(regmap);
+		}
+	} else if (of_find_property(node, "sprd,sec-clk", NULL)) {
+		svc_handle = sprd_sip_svc_get_handle();
+		if (!svc_handle) {
+			pr_err("%s: failed to get svc handle\n", __func__);
+			return -ENODEV;
+		}
+		sprd_clk_sec_set_svc_handle(desc, svc_handle);
+		return 0;
+	} else {
+		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+		base = devm_ioremap_resource(&pdev->dev, res);
+		if (IS_ERR(base))
+			return PTR_ERR(base);
+
+		regmap = devm_regmap_init_mmio(&pdev->dev, base,
+					       &sprdclk_regmap_config);
+		if (IS_ERR(regmap)) {
+			pr_err("failed to init regmap\n");
+			return PTR_ERR(regmap);
+		}
+	}
+
+	sprd_clk_set_regmap(desc, regmap);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(sprd_clk_regmap_init);
+
+/*
+ * Look up an optional named syscon on this node (via the generic
+ * "syscons"/"syscon-names" indexed-list convention - see
+ * sprd_syscon_get_regmap_by_name() above) and, if present, clear every bit
+ * in its mask. Used for every "this bit must be 0 before the node's own
+ * registers are reachable" switch found so far (shutdown_en/deepsleep/
+ * sysreset, ...): all of them are clear-to-release bits, unlike "enable"
+ * (set-to-grant) and "power" (clear-to-release, but tracked separately
+ * above since it needs its own before/after diagnostic pair alongside
+ * "enable"). Returns 0 on success (including "not found", which is a
+ * no-op for nodes that don't declare this syscon), or a negative errno if
+ * the syscon was found but the write itself failed.
+ */
+static int sprd_clk_clear_optional_syscon(struct device_node *node, const char *name)
+{
+	struct regmap *regmap;
+	u32 reg = 0, mask = 0;
+	int ret;
+
+	regmap = sprd_syscon_get_regmap_by_name(node, name, &reg, &mask);
+	if (IS_ERR(regmap))
+		return PTR_ERR(regmap);
+
+	ret = regmap_update_bits(regmap, reg, mask, 0);
+
+	return ret;
+}
+
+int sprd_clk_probe(struct device *dev, struct clk_hw_onecell_data *clkhw)
+{
+	int i, ret;
+	struct clk_hw *hw;
+	struct device_node *node = dev->of_node;
+	struct regmap *enable_regmap, *power_regmap;
+	u32 enable_reg = 0, power_reg = 0;
+	u32 enable_mask = 0, power_mask = 0;
+	bool touches_power_domain = false;
+
+	/*
+	 * ROOT CAUSE FIX (real-hardware diagnostic, 2026-10-20): this
+	 * enable/power syscon setup used to run AFTER the clock-registration
+	 * loop below. For a clk-provider node whose own register block sits
+	 * behind this exact "enable"/"power" DT phandle (e.g. the GPU's own
+	 * clk block at 0x60100000, gated via sharkl5pro-clk.c's
+	 * "sprd,sharkl5pro-gpu-clk" node), that ordering is fatal: the
+	 * registration loop's devm_clk_hw_register() -> __clk_register() ->
+	 * clk_core_is_enabled() calls every gate's .is_enabled(), which does
+	 * a regmap_read() of the clk's *own* register - but that register
+	 * block has no power/bus access yet, because the code that was
+	 * supposed to grant it (right here) hadn't run. Confirmed on real
+	 * hardware via an in-driver diagnostic print in gate.c's
+	 * sprd_gate_is_enabled(): the kernel panics with a "synchronous
+	 * external abort" doing regmap_read() for clk=gpu-core-gate
+	 * (common->reg offset 0x4, i.e. GPU_TOP + 0x4) the very first time
+	 * any gate clock is registered for the "sprd,sharkl5pro-gpu-clk"
+	 * node - immediately inside sprd_clk_probe()'s own registration
+	 * loop, long before this function ever reached the enable/power
+	 * code further down. (Three separate, now-disproven theories were
+	 * chased before this was pinned down with the diagnostic print:
+	 * a static SPL/BL31/TOS TrustZone firewall on PMU_APB, the
+	 * sprd_sip_fw SIP service's first SMC call "locking" PLL registers,
+	 * and the generic clk/genpd "disable unused" late_initcall_sync
+	 * pass - all ruled out by direct testing, because the crash never
+	 * involved PMU_APB's ISPPLL_REL_CFG at all; it was always this GPU
+	 * block, and it was always this probe-order bug.)
+	 *
+	 * Moving this block above the loop means any clk-provider node that
+	 * declares "enable"/"power" phandles gets its own register block's
+	 * bus/power switched on *before* any of its clocks are registered
+	 * (and thus before anything calls .is_enabled() on them) - which is
+	 * what this code was clearly meant to guarantee in the first place.
+	 * For every other clk-provider node (the ones with no "enable"/
+	 * "power" property - IS_ERR(enable_regmap)/IS_ERR(power_regmap)
+	 * stays true), this is a no-op, so no other clock group's behavior
+	 * changes.
+	 *
+	 * NOTE (DTS-confirmed, see the sprd_syscon_get_regmap_by_name()
+	 * comment above): this board's DTS encodes "enable"/"power" via the
+	 * "syscons"/"syscon-names" indexed-list convention, not as literal
+	 * "enable"/"power" phandle properties - hence the switch below from
+	 * syscon_regmap_lookup_by_phandle_args() to that helper.
+	 */
+	pr_info("sprd_clk_probe: node=%pOFn\n", node);
+
+	enable_regmap = sprd_syscon_get_regmap_by_name(node, "enable",
+							&enable_reg, &enable_mask);
+	if (!IS_ERR(enable_regmap)) {
+		/*
+		 * Diagnostic-confirmed (2026-10-20): this is an "_EB"
+		 * (Enable Bit) register, same convention as every other
+		 * SPRD "_EB"-named gate in this SoC - bit=1 means enabled.
+		 * Set the bit to grant this node's own register block its
+		 * AHB/APB bus access.
+		 */
+		ret = regmap_update_bits(enable_regmap, enable_reg, enable_mask,
+					  enable_mask);
+		if (ret)
+			return ret;
+		touches_power_domain = true;
+	} else {
+		/*
+		 * GKI 6.12 port note: node->name faulted at runtime - this
+		 * device's struct device_node->name field isn't reliably
+		 * populated (NULL) the way the old vendor kernel's DT core
+		 * guaranteed, and dev_dbg()'s "%s" dereferences it
+		 * unconditionally (dynamic debug still evaluates/formats the
+		 * args even when the message isn't printed). %pOFn takes the
+		 * device_node pointer itself and safely prints "(null)"
+		 * instead of crashing if it's ever NULL.
+		 */
+		dev_dbg(dev, "%pOFn has no enable syscon\n", node);
+	}
+
+	power_regmap = sprd_syscon_get_regmap_by_name(node, "power",
+						       &power_reg, &power_mask);
+	if (!IS_ERR(power_regmap)) {
+		/*
+		 * Diagnostic-confirmed (2026-10-20): this is a
+		 * "_FORCE_SHUTDOWN" bit - set=1 means the power domain is
+		 * forced OFF, same as every other SPRD "_FORCE_SHUTDOWN"
+		 * bit in this SoC. Clear the bit to release the forced
+		 * shutdown and power this node's own block on.
+		 */
+		ret = regmap_update_bits(power_regmap, power_reg, power_mask, 0);
+		if (ret)
+			return ret;
+		touches_power_domain = true;
+	} else {
+		/* See the %pOFn note above the enable-syscon lookup. */
+		dev_dbg(dev, "%pOFn has no power syscon\n", node);
+	}
+
+	/*
+	 * Optional third syscon, "shutdown_en": some power domains on this
+	 * SoC (MM_TOP confirmed via real-hardware log, 2026-10-20; see the
+	 * comment on the "power" lookup above) have an AUTO_SHUTDOWN_EN bit
+	 * that, left at its hardware-default (enabled), lets the domain
+	 * silently re-assert FORCE_SHUTDOWN some time after we clear it
+	 * above - with no further register write from software. Clearing
+	 * this bit (when the node declares it) disables that auto-shutdown
+	 * and keeps the domain up. Nodes with no such bit (e.g. GPU_TOP)
+	 * simply have no "shutdown_en" syscon, so this is a no-op for them.
+	 */
+	ret = sprd_clk_clear_optional_syscon(node, "shutdown_en");
+	if (ret < 0 && ret != -EINVAL && ret != -ENODATA)
+		return ret;
+
+	/*
+	 * ROOT CAUSE FIX, part 2.5 (real-hardware diagnostic, 2026-10-20):
+	 * audcpapb-gate/audcpahb-gate hung (no abort at all - a genuine bus
+	 * stall on the readl instruction itself) reading their own "wdg-eb"
+	 * gate even after "enable" (AP_2_AUD_ACCESS_EN) and "power"
+	 * (PD_AUDCP_SYS_FORCE_SHUTDOWN) were both confirmed set/cleared.
+	 * The real DTS's "audiocp_boot" node (sprd,sharkl5pro-audcp-boot)
+	 * shows two more gates that sit strictly *below* the simple power
+	 * switch: "deepsleep" (PMU_APB_RF_SLEEP_CTRL's
+	 * AUDCP_FORCE_DEEP_SLEEP - forces the whole AUDCP block into a
+	 * sleep state that doesn't just power it down but stops it from
+	 * acknowledging bus transactions at all) and "sysreset"
+	 * (PMU_APB_RF_CP_SOFT_RST's AUDCP_SYS_SOFT_RST - a *separate* reset
+	 * line from the power-shutdown switch; an APB/AHB slave held in
+	 * reset typically never asserts its bus-ready handshake at all,
+	 * which stalls the master's load instruction indefinitely instead
+	 * of ever reaching a bus-timeout abort - exactly the silent hang
+	 * observed, as opposed to every previous GPU_TOP/MM_TOP case, which
+	 * were pure power-gate issues and always produced a clean,
+	 * immediate synchronous external abort). Clearing both, like
+	 * "shutdown_en" above, is a no-op for nodes that don't declare them.
+	 */
+	ret = sprd_clk_clear_optional_syscon(node, "deepsleep");
+	if (ret < 0 && ret != -EINVAL && ret != -ENODATA)
+		return ret;
+
+	ret = sprd_clk_clear_optional_syscon(node, "sysreset");
+	if (ret < 0 && ret != -EINVAL && ret != -ENODATA)
+		return ret;
+
+	/*
+	 * ROOT CAUSE FIX, part 4 (real-hardware diagnostic, 2026-10-20):
+	 * the "enable"/"power"/"shutdown_en"/"deepsleep"/"sysreset" writes
+	 * above complete instantly from the CPU's point of view (they're
+	 * just flops in the AON_APB/PMU_APB register block), but on this
+	 * SoC a PD_xxx_TOP_FORCE_SHUTDOWN clear only *starts* the PMU's
+	 * internal power sequencer - rail ramp-up, isolation-cell release
+	 * and reset de-assertion for the target block (GPU_TOP, MM_TOP, ...)
+	 * all happen asynchronously in hardware afterwards and are not
+	 * reflected anywhere this driver can poll. Immediately registering
+	 * this node's own clocks right after the write (which calls each
+	 * gate's .is_enabled(), i.e. a regmap_read() of a register *inside*
+	 * that same block) races the sequencer and aborts if it loses.
+	 *
+	 * This was masked for a long time by this function's own verbose
+	 * pr_info() diagnostics - NOT because each printed line itself took
+	 * long, but because this board boots with "nosmp" (a single CPU):
+	 * every pr_info() to the slow, polled UART console holds that one
+	 * CPU for several milliseconds, during which the *other* thread
+	 * that's mid-probe for some power-gated node is simply never
+	 * scheduled at all. By the time that other thread got the CPU back
+	 * and did its register read, real wall-clock time on the order of
+	 * 100ms+ had elapsed since its own power-up write (confirmed by
+	 * comparing timestamps across threads in the diagnostic logs) -
+	 * easily enough for the hardware sequencer to finish, purely as a
+	 * side effect of scheduling, not of anything this function did on
+	 * purpose. Removing those prints collapsed that incidental gap to
+	 * a few tens of microseconds and the exact same abort came back -
+	 * first on mm_gate's "mm-cpp-eb", then (after a too-small explicit
+	 * delay was tried here) on some other, even-earlier power-gated
+	 * node - because whichever one happens to register its clocks
+	 * first after its own power-up write is whichever one loses the
+	 * race against the sequencer.
+	 *
+	 * Fix for real, independent of any print/scheduling timing: wait
+	 * here, explicitly, for any node that touched a power-domain switch
+	 * above, before registering its own clocks. A first attempt at
+	 * this used usleep_range(300, 600) (microseconds) and still
+	 * crashed - that's three orders of magnitude short of the ~100ms+
+	 * incidental gap that was actually making this work before. Use
+	 * msleep(10) instead: still negligible against total boot time
+	 * (this only runs for the handful of nodes that declare "enable"/
+	 * "power", not every clk-provider - at most a few tens of ms added
+	 * in total), but in the same ballpark as the gap that was
+	 * empirically confirmed to work.
+	 */
+	if (touches_power_domain)
+		msleep(10);
+
+	/*
+	 * ROOT CAUSE FIX, part 3 (real-hardware diagnostic, 2026-10-20):
+	 * clearing a node's own "enable"/"power"/"shutdown_en" syscons (above)
+	 * is not always enough - mm_clk (0x62100000, "sprd,sharkl5pro-mm-clk")
+	 * still aborted reading its own mux register even after mm_gate's
+	 * identical-looking fix made mm_gate's own block (0x62200000) fully
+	 * accessible, because mm_clk's bus access depends on a *clock*
+	 * ("mm-ckg-eb", registered by mm_gate as CLK_MM_CKG_EB), not a simple
+	 * syscon bit. The real sprd,mm-domain genpd driver this SoC was
+	 * designed for clk_prepare_enable()s a short list of such clocks
+	 * ("clk_mm_eb", "clk_mm_ahb_eb", ...) before touching MM hardware;
+	 * this port has no such genpd driver, so nothing ever enables them.
+	 *
+	 * Generic equivalent: clk_prepare_enable() every phandle this node's
+	 * own "clocks" property lists, before registering this node's own
+	 * clocks. For nodes whose listed clocks are purely informational
+	 * (already on, or not gating this node's own register access) this
+	 * is a harmless idempotent enable. For nodes with no "clocks"
+	 * property (of_clk_get() index 0 fails immediately), it's a no-op.
+	 * These clocks are deliberately never disabled again - this port has
+	 * no runtime PM for these early clk-provider nodes, so matching the
+	 * "always on once needed at boot" behavior used elsewhere here.
+	 */
+	for (i = 0; ; i++) {
+		struct clk *pclk;
+
+		pclk = of_clk_get(node, i);
+		if (IS_ERR(pclk))
+			break;
+
+		clk_prepare_enable(pclk);
+		/*
+		 * Intentionally leak the reference: we want this clock held
+		 * enabled for the life of the kernel, and clk_put() isn't
+		 * needed for correctness here (no module unload path for
+		 * this always-on boot clock in this port).
+		 */
+	}
+
+	for (i = 0; i < clkhw->num; i++) {
+		const char *name;
+
+		hw = clkhw->hws[i];
+
+		if (!hw)
+			continue;
+
+		/*
+		 * GKI 6.12 port note: hw->init must be read BEFORE calling
+		 * devm_clk_hw_register() - the clk core clears hw->init to
+		 * NULL once it has copied what it needs out of it,
+		 * regardless of whether registration succeeds or fails.
+		 * The original code read hw->init->name only in the
+		 * failure branch below, after the call already nulled it
+		 * out, which is a NULL deref on every registration failure
+		 * (this is what actually crashed here, once composite
+		 * clocks started failing .determine_rate validation - see
+		 * the composite.c fix).
+		 */
+		name = hw->init->name;
+
+		ret = devm_clk_hw_register(dev, hw);
+		if (ret) {
+			dev_err(dev, "Couldn't register clock %d - %s\n",
+				i, name);
+			return ret;
+		}
+	}
+
+	ret = devm_of_clk_add_hw_provider(dev, of_clk_hw_onecell_get, clkhw);
+	if (ret) {
+		dev_err(dev, "Failed to add clock provider\n");
+		return ret;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(sprd_clk_probe);
+
+MODULE_LICENSE("GPL v2");

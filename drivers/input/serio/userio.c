@@ -77,7 +77,7 @@ static int userio_char_open(struct inode *inode, struct file *file)
 {
 	struct userio_device *userio;
 
-	userio = kzalloc(sizeof(struct userio_device), GFP_KERNEL);
+	userio = kzalloc(sizeof(*userio), GFP_KERNEL);
 	if (!userio)
 		return -ENOMEM;
 
@@ -85,7 +85,7 @@ static int userio_char_open(struct inode *inode, struct file *file)
 	spin_lock_init(&userio->buf_lock);
 	init_waitqueue_head(&userio->waitq);
 
-	userio->serio = kzalloc(sizeof(struct serio), GFP_KERNEL);
+	userio->serio = kzalloc(sizeof(*userio->serio), GFP_KERNEL);
 	if (!userio->serio) {
 		kfree(userio);
 		return -ENOMEM;
@@ -248,14 +248,14 @@ out:
 	return error ?: count;
 }
 
-static unsigned int userio_char_poll(struct file *file, poll_table *wait)
+static __poll_t userio_char_poll(struct file *file, poll_table *wait)
 {
 	struct userio_device *userio = file->private_data;
 
 	poll_wait(file, &userio->waitq, wait);
 
 	if (userio->head != userio->tail)
-		return POLLIN | POLLRDNORM;
+		return EPOLLIN | EPOLLRDNORM;
 
 	return 0;
 }
@@ -267,7 +267,6 @@ static const struct file_operations userio_fops = {
 	.read		= userio_char_read,
 	.write		= userio_char_write,
 	.poll		= userio_char_poll,
-	.llseek		= no_llseek,
 };
 
 static struct miscdevice userio_misc = {

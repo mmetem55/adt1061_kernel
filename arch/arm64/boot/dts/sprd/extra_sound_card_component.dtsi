@@ -1,0 +1,43 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Extra sound-card component: a small, separate "all-i2s" sound card
+ * (null codec) built on top of the i2s0 (i2s_bt_sco0, aidata-sharkl5Pro.dtsi)
+ * controller and its own dedicated PCM platform node. This mirrors the
+ * stock board's sound@1 / sprd-pcm-iis nodes (confirmed against the stock
+ * dtb dump) and is independent of the main sprd-audio-card defined in
+ * sprd-sound-fe-be.dtsi.
+ */
+
+/ {
+	sprd_pcm_iis: sprd-pcm-iis {
+		compatible = "sprd,sharkl5-pcm-platform";
+		#sound-dai-cells = <0>;
+		/* agcp dma, iis0 tx/rx */
+		dmas = <&agcp_dma 5 &agcp_dma 6>;
+		dma-names = "iis0_tx", "iis0_rx";
+		sprd,dma-2stage-usecase = <2>;
+		sprd,node-count-2stage-level-1 = <1>;
+		sprd,syscon-pmu-apb = <2>;
+		sprd,dma-2stage-level-1-int-source = <1>;
+	};
+
+	sound@1 {
+		compatible = "sprd,i2s-null-codec";
+		status = "okay";
+		sprd-audio-card,name = "all-i2s";
+
+		sprd-audio-card,dai-link@0 {
+			plat {
+				sound-dai = <&sprd_pcm_iis>;
+			};
+
+			cpu {
+				sound-dai = <&i2s0>;
+			};
+
+			codec {
+				sound-dai = <0 0>;
+			};
+		};
+	};
+};

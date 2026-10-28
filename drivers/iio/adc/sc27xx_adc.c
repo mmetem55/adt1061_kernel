@@ -4,20 +4,21 @@
 #include <linux/hwspinlock.h>
 #include <linux/iio/iio.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/nvmem-consumer.h>
 #include <linux/of.h>
-#include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
+#include <linux/regulator/consumer.h>
 #include <linux/slab.h>
 
 /* PMIC global registers definition */
-#define SC2731_MODULE_EN		0xc08
 #define SC2730_MODULE_EN		0x1808
+#define SC2731_MODULE_EN		0xc08
 #define SC27XX_MODULE_ADC_EN		BIT(5)
 #define SC2721_ARM_CLK_EN		0xc0c
-#define SC2731_ARM_CLK_EN		0xc10
 #define SC2730_ARM_CLK_EN		0x180c
+#define SC2731_ARM_CLK_EN		0xc10
 #define SC27XX_CLK_ADC_EN		BIT(5)
 #define SC27XX_CLK_ADC_CLK_EN		BIT(6)
 
@@ -59,12 +60,12 @@
 /* Timeout (ms) for the trylock of hardware spinlocks */
 #define SC27XX_ADC_HWLOCK_TIMEOUT	5000
 
+/* Timeout (us) for ADC data conversion according to ADC datasheet */
+#define SC27XX_ADC_RDY_TIMEOUT		1000000
+#define SC27XX_ADC_POLL_RAW_STATUS	500
+
 /* Maximum ADC channel number */
 #define SC27XX_ADC_CHANNEL_MAX		32
-
-/* Timeout (us) for ADC data conversion according to ADC datasheet */
-#define SC27XX_ADC_RDY_TIMEOUT	1000000
-#define SC27XX_ADC_POLL_RAW_STATUS	500
 
 /* ADC voltage ratio definition */
 #define SC27XX_VOLT_RATIO(n, d)		\
@@ -72,9 +73,18 @@
 #define SC27XX_RATIO_NUMERATOR_OFFSET	16
 #define SC27XX_RATIO_DENOMINATOR_MASK	GENMASK(15, 0)
 
+/* ADC specific channel reference voltage 3.5V */
+#define SC27XX_ADC_REFVOL_VDD35		3500000
+
+/* ADC default channel reference voltage is 2.8V */
+#define SC27XX_ADC_REFVOL_VDD28		2800000
+
 struct sc27xx_adc_data {
 	struct device *dev;
+	struct regulator *volref;
 	struct regmap *regmap;
+	/* lock to protect against multiple access to the device */
+	struct mutex lock;
 	/*
 	 * One hardware spinlock to synchronize between the multiple
 	 * subsystems which will access the unique ADC controller.
@@ -100,6 +110,7 @@ struct sc27xx_adc_variant_data {
 	const struct sc27xx_adc_linear_graph *sscale_cal;
 	void (*init_scale)(struct sc27xx_adc_data *data);
 	int (*get_ratio)(int channel, int scale);
+	bool set_volref;
 };
 
 struct sc27xx_adc_linear_graph {
@@ -125,12 +136,12 @@ static struct sc27xx_adc_linear_graph small_scale_graph = {
 	100, 341,
 };
 
-static const struct sc27xx_adc_linear_graph sc2721_big_scale_graph_calib = {
+static const struct sc27xx_adc_linear_graph sc2731_big_scale_graph_calib = {
 	4200, 850,
 	3600, 728,
 };
 
-static const struct sc27xx_adc_linear_graph sc2721_small_scale_graph_calib = {
+static const struct sc27xx_adc_linear_graph sc2731_small_scale_graph_calib = {
 	1000, 838,
 	100, 84,
 };
@@ -150,16 +161,41 @@ static int sc27xx_adc_get_calib_data(u32 calib_data, int calib_adc)
 	return ((calib_data & 0xff) + calib_adc - 128) * 4;
 }
 
+/* get the adc nvmem cell calibration data */
+static int adc_nvmem_cell_calib_data(struct sc27xx_adc_data *data, const char *cell_name)
+{
+	struct nvmem_cell *cell;
+	void *buf;
+	u32 origin_calib_data = 0;
+	size_t len;
+
+	if (!data)
+		return -EINVAL;
+
+	cell = nvmem_cell_get(data->dev, cell_name);
+	if (IS_ERR(cell))
+		return PTR_ERR(cell);
+
+	buf = nvmem_cell_read(cell, &len);
+	if (IS_ERR(buf)) {
+		nvmem_cell_put(cell);
+		return PTR_ERR(buf);
+	}
+
+	memcpy(&origin_calib_data, buf, min(len, sizeof(u32)));
+
+	kfree(buf);
+	nvmem_cell_put(cell);
+	return origin_calib_data;
+}
+
 static int sc27xx_adc_scale_calibration(struct sc27xx_adc_data *data,
 					bool big_scale)
 {
 	const struct sc27xx_adc_linear_graph *calib_graph;
 	struct sc27xx_adc_linear_graph *graph;
-	struct nvmem_cell *cell;
 	const char *cell_name;
 	u32 calib_data = 0;
-	void *buf;
-	size_t len;
 
 	if (big_scale) {
 		calib_graph = data->var_data->bscale_cal;
@@ -171,24 +207,13 @@ static int sc27xx_adc_scale_calibration(struct sc27xx_adc_data *data,
 		cell_name = "small_scale_calib";
 	}
 
-	cell = nvmem_cell_get(data->dev, cell_name);
-	if (IS_ERR(cell))
-		return PTR_ERR(cell);
-
-	buf = nvmem_cell_read(cell, &len);
-	nvmem_cell_put(cell);
-
-	if (IS_ERR(buf))
-		return PTR_ERR(buf);
-
-	memcpy(&calib_data, buf, min(len, sizeof(u32)));
+	calib_data = adc_nvmem_cell_calib_data(data, cell_name);
 
 	/* Only need to calibrate the adc values in the linear graph. */
 	graph->adc0 = sc27xx_adc_get_calib_data(calib_data, calib_graph->adc0);
 	graph->adc1 = sc27xx_adc_get_calib_data(calib_data >> 8,
 						calib_graph->adc1);
 
-	kfree(buf);
 	return 0;
 }
 
@@ -249,6 +274,33 @@ static int sc2720_adc_get_ratio(int channel, int scale)
 		default:
 			return SC27XX_VOLT_RATIO(1, 1);
 		}
+	}
+	return SC27XX_VOLT_RATIO(1, 1);
+}
+
+static int sc2721_adc_get_ratio(int channel, int scale)
+{
+	switch (channel) {
+	case 1:
+	case 2:
+	case 3:
+	case 4:
+		return scale ? SC27XX_VOLT_RATIO(400, 1025) :
+			SC27XX_VOLT_RATIO(1, 1);
+	case 5:
+		return SC27XX_VOLT_RATIO(7, 29);
+	case 7:
+	case 9:
+		return scale ? SC27XX_VOLT_RATIO(100, 125) :
+			SC27XX_VOLT_RATIO(1, 1);
+	case 14:
+		return SC27XX_VOLT_RATIO(68, 900);
+	case 16:
+		return SC27XX_VOLT_RATIO(48, 100);
+	case 19:
+		return SC27XX_VOLT_RATIO(1, 3);
+	default:
+		return SC27XX_VOLT_RATIO(1, 1);
 	}
 	return SC27XX_VOLT_RATIO(1, 1);
 }
@@ -327,33 +379,6 @@ static int sc2730_adc_get_ratio(int channel, int scale)
 	return SC27XX_VOLT_RATIO(1, 1);
 }
 
-static int sc2721_adc_get_ratio(int channel, int scale)
-{
-	switch (channel) {
-	case 1:
-	case 2:
-	case 3:
-	case 4:
-		return scale ? SC27XX_VOLT_RATIO(400, 1025) :
-			SC27XX_VOLT_RATIO(1, 1);
-	case 5:
-		return SC27XX_VOLT_RATIO(7, 29);
-	case 7:
-	case 9:
-		return scale ? SC27XX_VOLT_RATIO(100, 125) :
-			SC27XX_VOLT_RATIO(1, 1);
-	case 14:
-		return SC27XX_VOLT_RATIO(68, 900);
-	case 16:
-		return SC27XX_VOLT_RATIO(48, 100);
-	case 19:
-		return SC27XX_VOLT_RATIO(1, 3);
-	default:
-		return SC27XX_VOLT_RATIO(1, 1);
-	}
-	return SC27XX_VOLT_RATIO(1, 1);
-}
-
 static int sc2731_adc_get_ratio(int channel, int scale)
 {
 	switch (channel) {
@@ -379,6 +404,9 @@ static int sc2731_adc_get_ratio(int channel, int scale)
 	return SC27XX_VOLT_RATIO(1, 1);
 }
 
+/*
+ * According to the datasheet set specific value on some channel.
+ */
 static void sc2720_adc_scale_init(struct sc27xx_adc_data *data)
 {
 	int i;
@@ -407,39 +435,57 @@ static void sc2720_adc_scale_init(struct sc27xx_adc_data *data)
 	}
 }
 
-static void sc2731_adc_scale_init(struct sc27xx_adc_data *data)
-{
-	int i;
-
-	for (i = 0; i < SC27XX_ADC_CHANNEL_MAX; i++) {
-		if (i == 5)
-			data->channel_scale[i] = 1;
-		else
-			data->channel_scale[i] = 0;
-	}
-}
-
 static void sc2730_adc_scale_init(struct sc27xx_adc_data *data)
 {
 	int i;
 
 	for (i = 0; i < SC27XX_ADC_CHANNEL_MAX; i++) {
-		if (i == 5 || i == 10 || i == 19 || i == 30 || i == 31)
+		switch (i) {
+		case 5:
+		case 10:
+		case 19:
+		case 30:
+		case 31:
 			data->channel_scale[i] = 3;
-		else if (i == 7 || i == 9)
+			break;
+		case 7:
+		case 9:
 			data->channel_scale[i] = 2;
-		else if (i == 13)
+			break;
+		case 13:
 			data->channel_scale[i] = 1;
-		else
+			break;
+		default:
 			data->channel_scale[i] = 0;
+			break;
+		}
+	}
+}
+
+static void sc2731_adc_scale_init(struct sc27xx_adc_data *data)
+{
+	int i;
+	/*
+	 * In the current software design, SC2731 support 2 scales,
+	 * channels 5 uses big scale, others use smale.
+	 */
+	for (i = 0; i < SC27XX_ADC_CHANNEL_MAX; i++) {
+		switch (i) {
+		case 5:
+			data->channel_scale[i] = 1;
+			break;
+		default:
+			data->channel_scale[i] = 0;
+			break;
+		}
 	}
 }
 
 static int sc27xx_adc_read(struct sc27xx_adc_data *data, int channel,
 			   int scale, int *val)
 {
-	int ret;
-	u32 rawdata, tmp, status;
+	int ret, ret_volref;
+	u32 tmp, value, status;
 
 	ret = hwspin_lock_timeout_raw(data->hwlock, SC27XX_ADC_HWLOCK_TIMEOUT);
 	if (ret) {
@@ -447,13 +493,28 @@ static int sc27xx_adc_read(struct sc27xx_adc_data *data, int channel,
 		return ret;
 	}
 
-	ret = regmap_update_bits(data->regmap, data->base + SC27XX_ADC_CTL,
-				 SC27XX_ADC_EN, SC27XX_ADC_EN);
-	if (ret)
-		goto unlock_adc;
+	/*
+	 * According to the sc2721 chip data sheet, the reference voltage of
+	 * specific channel 30 and channel 31 in ADC module needs to be set from
+	 * the default 2.8v to 3.5v.
+	 */
+	if ((data->var_data->set_volref) && (channel == 30 || channel == 31)) {
+		ret = regulator_set_voltage(data->volref,
+					SC27XX_ADC_REFVOL_VDD35,
+					SC27XX_ADC_REFVOL_VDD35);
+		if (ret) {
+			dev_err(data->dev, "failed to set the volref 3.5v\n");
+			goto unlock_adc;
+		}
+	}
 
-	ret = regmap_update_bits(data->regmap, data->base + SC27XX_ADC_INT_CLR,
-				 SC27XX_ADC_IRQ_CLR, SC27XX_ADC_IRQ_CLR);
+	ret = regmap_set_bits(data->regmap, data->base + SC27XX_ADC_CTL,
+			      SC27XX_ADC_EN);
+	if (ret)
+		goto regulator_restore;
+
+	ret = regmap_set_bits(data->regmap, data->base + SC27XX_ADC_INT_CLR,
+			      SC27XX_ADC_IRQ_CLR);
 	if (ret)
 		goto disable_adc;
 
@@ -476,8 +537,8 @@ static int sc27xx_adc_read(struct sc27xx_adc_data *data, int channel,
 	if (ret)
 		goto disable_adc;
 
-	ret = regmap_update_bits(data->regmap, data->base + SC27XX_ADC_CTL,
-				 SC27XX_ADC_CHN_RUN, SC27XX_ADC_CHN_RUN);
+	ret = regmap_set_bits(data->regmap, data->base + SC27XX_ADC_CTL,
+			      SC27XX_ADC_CHN_RUN);
 	if (ret)
 		goto disable_adc;
 
@@ -487,38 +548,50 @@ static int sc27xx_adc_read(struct sc27xx_adc_data *data, int channel,
 				       SC27XX_ADC_POLL_RAW_STATUS,
 				       SC27XX_ADC_RDY_TIMEOUT);
 	if (ret) {
-		dev_err(data->dev, "read adc timeout 0x%x\n", status);
+		dev_err(data->dev, "read adc timeout, status = 0x%x\n", status);
 		goto disable_adc;
 	}
 
-	ret = regmap_read(data->regmap, data->base + SC27XX_ADC_DATA,
-			  &rawdata);
-	rawdata &= SC27XX_ADC_DATA_MASK;
+	ret = regmap_read(data->regmap, data->base + SC27XX_ADC_DATA, &value);
+	if (ret)
+		goto disable_adc;
+
+	value &= SC27XX_ADC_DATA_MASK;
 
 disable_adc:
-	regmap_update_bits(data->regmap, data->base + SC27XX_ADC_CTL,
-			   SC27XX_ADC_EN, 0);
+	regmap_clear_bits(data->regmap, data->base + SC27XX_ADC_CTL,
+			  SC27XX_ADC_EN);
+regulator_restore:
+	if ((data->var_data->set_volref) && (channel == 30 || channel == 31)) {
+		ret_volref = regulator_set_voltage(data->volref,
+					    SC27XX_ADC_REFVOL_VDD28,
+					    SC27XX_ADC_REFVOL_VDD28);
+		if (ret_volref) {
+			dev_err(data->dev, "failed to set the volref 2.8v,ret_volref = 0x%x\n",
+					 ret_volref);
+			ret = ret || ret_volref;
+		}
+	}
 unlock_adc:
 	hwspin_unlock_raw(data->hwlock);
 
 	if (!ret)
-		*val = rawdata;
+		*val = value;
 
 	return ret;
 }
 
-static void sc27xx_adc_volt_ratio(struct sc27xx_adc_data *data,
-				  int channel, int scale,
-				  u32 *div_numerator, u32 *div_denominator)
+static void sc27xx_adc_volt_ratio(struct sc27xx_adc_data *data, int channel, int scale,
+				  struct u32_fract *fract)
 {
 	u32 ratio;
 
 	ratio = data->var_data->get_ratio(channel, scale);
-	*div_numerator = ratio >> SC27XX_RATIO_NUMERATOR_OFFSET;
-	*div_denominator = ratio & SC27XX_RATIO_DENOMINATOR_MASK;
+	fract->numerator = ratio >> SC27XX_RATIO_NUMERATOR_OFFSET;
+	fract->denominator = ratio & SC27XX_RATIO_DENOMINATOR_MASK;
 }
 
-static int sc27xx_adc_to_volt(struct sc27xx_adc_linear_graph *graph,
+static int adc_to_volt(struct sc27xx_adc_linear_graph *graph,
 			      int raw_adc)
 {
 	int tmp;
@@ -527,13 +600,23 @@ static int sc27xx_adc_to_volt(struct sc27xx_adc_linear_graph *graph,
 	tmp /= (graph->adc0 - graph->adc1);
 	tmp += graph->volt1;
 
+	return tmp;
+}
+
+static int sc27xx_adc_to_volt(struct sc27xx_adc_linear_graph *graph,
+			      int raw_adc)
+{
+	int tmp;
+
+	tmp = adc_to_volt(graph, raw_adc);
+
 	return tmp < 0 ? 0 : tmp;
 }
 
 static int sc27xx_adc_convert_volt(struct sc27xx_adc_data *data, int channel,
 				   int scale, int raw_adc)
 {
-	u32 numerator, denominator;
+	struct u32_fract fract;
 	u32 volt;
 
 	/*
@@ -555,9 +638,9 @@ static int sc27xx_adc_convert_volt(struct sc27xx_adc_data *data, int channel,
 		break;
 	}
 
-	sc27xx_adc_volt_ratio(data, channel, scale, &numerator, &denominator);
+	sc27xx_adc_volt_ratio(data, channel, scale, &fract);
 
-	return (volt * denominator + numerator / 2) / numerator;
+	return DIV_ROUND_CLOSEST(volt * fract.denominator, fract.numerator);
 }
 
 static int sc27xx_adc_read_processed(struct sc27xx_adc_data *data,
@@ -583,9 +666,9 @@ static int sc27xx_adc_read_raw(struct iio_dev *indio_dev,
 
 	switch (mask) {
 	case IIO_CHAN_INFO_RAW:
-		mutex_lock(&indio_dev->mlock);
+		mutex_lock(&data->lock);
 		ret = sc27xx_adc_read(data, chan->channel, scale, &tmp);
-		mutex_unlock(&indio_dev->mlock);
+		mutex_unlock(&data->lock);
 
 		if (ret)
 			return ret;
@@ -594,10 +677,10 @@ static int sc27xx_adc_read_raw(struct iio_dev *indio_dev,
 		return IIO_VAL_INT;
 
 	case IIO_CHAN_INFO_PROCESSED:
-		mutex_lock(&indio_dev->mlock);
+		mutex_lock(&data->lock);
 		ret = sc27xx_adc_read_processed(data, chan->channel, scale,
 						&tmp);
-		mutex_unlock(&indio_dev->mlock);
+		mutex_unlock(&data->lock);
 
 		if (ret)
 			return ret;
@@ -682,15 +765,14 @@ static int sc27xx_adc_enable(struct sc27xx_adc_data *data)
 {
 	int ret;
 
-	ret = regmap_update_bits(data->regmap, data->var_data->module_en,
-				 SC27XX_MODULE_ADC_EN, SC27XX_MODULE_ADC_EN);
+	ret = regmap_set_bits(data->regmap, data->var_data->module_en,
+			      SC27XX_MODULE_ADC_EN);
 	if (ret)
 		return ret;
 
 	/* Enable ADC work clock and controller clock */
-	ret = regmap_update_bits(data->regmap, data->var_data->clk_en,
-				 SC27XX_CLK_ADC_EN | SC27XX_CLK_ADC_CLK_EN,
-				 SC27XX_CLK_ADC_EN | SC27XX_CLK_ADC_CLK_EN);
+	ret = regmap_set_bits(data->regmap, data->var_data->clk_en,
+			      SC27XX_CLK_ADC_EN | SC27XX_CLK_ADC_CLK_EN);
 	if (ret)
 		goto disable_adc;
 
@@ -706,11 +788,11 @@ static int sc27xx_adc_enable(struct sc27xx_adc_data *data)
 	return 0;
 
 disable_clk:
-	regmap_update_bits(data->regmap, data->var_data->clk_en,
-			   SC27XX_CLK_ADC_EN | SC27XX_CLK_ADC_CLK_EN, 0);
+	regmap_clear_bits(data->regmap, data->var_data->clk_en,
+			  SC27XX_CLK_ADC_EN | SC27XX_CLK_ADC_CLK_EN);
 disable_adc:
-	regmap_update_bits(data->regmap, data->var_data->module_en,
-			   SC27XX_MODULE_ADC_EN, 0);
+	regmap_clear_bits(data->regmap, data->var_data->module_en,
+			  SC27XX_MODULE_ADC_EN);
 
 	return ret;
 }
@@ -720,40 +802,23 @@ static void sc27xx_adc_disable(void *_data)
 	struct sc27xx_adc_data *data = _data;
 
 	/* Disable ADC work clock and controller clock */
-	regmap_update_bits(data->regmap, data->var_data->clk_en,
-			   SC27XX_CLK_ADC_EN | SC27XX_CLK_ADC_CLK_EN, 0);
+	regmap_clear_bits(data->regmap, data->var_data->clk_en,
+			  SC27XX_CLK_ADC_EN | SC27XX_CLK_ADC_CLK_EN);
 
-	regmap_update_bits(data->regmap, data->var_data->module_en,
-			   SC27XX_MODULE_ADC_EN, 0);
-}
-
-static void sc27xx_adc_free_hwlock(void *_data)
-{
-	struct hwspinlock *hwlock = _data;
-
-	hwspin_lock_free(hwlock);
+	regmap_clear_bits(data->regmap, data->var_data->module_en,
+			  SC27XX_MODULE_ADC_EN);
 }
 
 static const struct sc27xx_adc_variant_data sc2731_data = {
 	.module_en = SC2731_MODULE_EN,
 	.clk_en = SC2731_ARM_CLK_EN,
-	.scale_shift = SC2721_ADC_SCALE_SHIFT,
-	.scale_mask = SC2721_ADC_SCALE_MASK,
-	.bscale_cal = &sc2721_big_scale_graph_calib,
-	.sscale_cal = &sc2721_small_scale_graph_calib,
+	.scale_shift = SC27XX_ADC_SCALE_SHIFT,
+	.scale_mask = SC27XX_ADC_SCALE_MASK,
+	.bscale_cal = &sc2731_big_scale_graph_calib,
+	.sscale_cal = &sc2731_small_scale_graph_calib,
 	.init_scale = sc2731_adc_scale_init,
 	.get_ratio = sc2731_adc_get_ratio,
-};
-
-static const struct sc27xx_adc_variant_data sc2721_data = {
-	.module_en = SC2731_MODULE_EN,
-	.clk_en = SC2721_ARM_CLK_EN,
-	.scale_shift = SC2721_ADC_SCALE_SHIFT,
-	.scale_mask = SC2721_ADC_SCALE_MASK,
-	.bscale_cal = &sc2721_big_scale_graph_calib,
-	.sscale_cal = &sc2721_small_scale_graph_calib,
-	.init_scale = sc2731_adc_scale_init,
-	.get_ratio = sc2721_adc_get_ratio,
+	.set_volref = false,
 };
 
 static const struct sc27xx_adc_variant_data sc2730_data = {
@@ -765,6 +830,19 @@ static const struct sc27xx_adc_variant_data sc2730_data = {
 	.sscale_cal = &small_scale_graph_calib,
 	.init_scale = sc2730_adc_scale_init,
 	.get_ratio = sc2730_adc_get_ratio,
+	.set_volref = false,
+};
+
+static const struct sc27xx_adc_variant_data sc2721_data = {
+	.module_en = SC2731_MODULE_EN,
+	.clk_en = SC2721_ARM_CLK_EN,
+	.scale_shift = SC2721_ADC_SCALE_SHIFT,
+	.scale_mask = SC2721_ADC_SCALE_MASK,
+	.bscale_cal = &sc2731_big_scale_graph_calib,
+	.sscale_cal = &sc2731_small_scale_graph_calib,
+	.init_scale = sc2731_adc_scale_init,
+	.get_ratio = sc2721_adc_get_ratio,
+	.set_volref = true,
 };
 
 static const struct sc27xx_adc_variant_data sc2720_data = {
@@ -776,92 +854,93 @@ static const struct sc27xx_adc_variant_data sc2720_data = {
 	.sscale_cal = &small_scale_graph_calib,
 	.init_scale = sc2720_adc_scale_init,
 	.get_ratio = sc2720_adc_get_ratio,
+	.set_volref = false,
 };
 
 static int sc27xx_adc_probe(struct platform_device *pdev)
 {
-	struct device_node *np = pdev->dev.of_node;
+	struct device *dev = &pdev->dev;
+	struct device_node *np = dev->of_node;
 	struct sc27xx_adc_data *sc27xx_data;
 	const struct sc27xx_adc_variant_data *pdata;
 	struct iio_dev *indio_dev;
 	int ret;
 
-	pdata = of_device_get_match_data(&pdev->dev);
+	pdata = of_device_get_match_data(dev);
 	if (!pdata) {
-		dev_err(&pdev->dev, "No matching driver data found\n");
+		dev_err(dev, "No matching driver data found\n");
 		return -EINVAL;
 	}
 
-	indio_dev = devm_iio_device_alloc(&pdev->dev, sizeof(*sc27xx_data));
+	indio_dev = devm_iio_device_alloc(dev, sizeof(*sc27xx_data));
 	if (!indio_dev)
 		return -ENOMEM;
 
 	sc27xx_data = iio_priv(indio_dev);
 
-	sc27xx_data->regmap = dev_get_regmap(pdev->dev.parent, NULL);
+	sc27xx_data->regmap = dev_get_regmap(dev->parent, NULL);
 	if (!sc27xx_data->regmap) {
-		dev_err(&pdev->dev, "failed to get ADC regmap\n");
+		dev_err(dev, "failed to get ADC regmap\n");
 		return -ENODEV;
 	}
 
 	ret = of_property_read_u32(np, "reg", &sc27xx_data->base);
 	if (ret) {
-		dev_err(&pdev->dev, "failed to get ADC base address\n");
+		dev_err(dev, "failed to get ADC base address\n");
 		return ret;
 	}
 
 	sc27xx_data->irq = platform_get_irq(pdev, 0);
-	if (sc27xx_data->irq < 0) {
-		dev_err(&pdev->dev, "failed to get ADC irq number\n");
+	if (sc27xx_data->irq < 0)
 		return sc27xx_data->irq;
-	}
 
 	ret = of_hwspin_lock_get_id(np, 0);
 	if (ret < 0) {
-		dev_err(&pdev->dev, "failed to get hwspinlock id\n");
+		dev_err(dev, "failed to get hwspinlock id\n");
 		return ret;
 	}
 
-	sc27xx_data->hwlock = hwspin_lock_request_specific(ret);
+	sc27xx_data->hwlock = devm_hwspin_lock_request_specific(dev, ret);
 	if (!sc27xx_data->hwlock) {
-		dev_err(&pdev->dev, "failed to request hwspinlock\n");
+		dev_err(dev, "failed to request hwspinlock\n");
 		return -ENXIO;
 	}
 
-	ret = devm_add_action(&pdev->dev, sc27xx_adc_free_hwlock,
-			      sc27xx_data->hwlock);
-	if (ret) {
-		sc27xx_adc_free_hwlock(sc27xx_data->hwlock);
-		dev_err(&pdev->dev, "failed to add hwspinlock action\n");
-		return ret;
+	sc27xx_data->dev = dev;
+	if (pdata->set_volref) {
+		sc27xx_data->volref = devm_regulator_get(dev, "vref");
+		if (IS_ERR(sc27xx_data->volref)) {
+			ret = PTR_ERR(sc27xx_data->volref);
+			return dev_err_probe(dev, ret, "failed to get ADC volref\n");
+		}
 	}
 
-	sc27xx_data->dev = &pdev->dev;
 	sc27xx_data->var_data = pdata;
-
 	sc27xx_data->var_data->init_scale(sc27xx_data);
+
 	ret = sc27xx_adc_enable(sc27xx_data);
 	if (ret) {
-		dev_err(&pdev->dev, "failed to enable ADC module\n");
+		dev_err(dev, "failed to enable ADC module\n");
 		return ret;
 	}
 
-	ret = devm_add_action(&pdev->dev, sc27xx_adc_disable, sc27xx_data);
+	ret = devm_add_action_or_reset(dev, sc27xx_adc_disable, sc27xx_data);
 	if (ret) {
-		sc27xx_adc_disable(sc27xx_data);
-		dev_err(&pdev->dev, "failed to add ADC disable action\n");
+		dev_err(dev, "failed to add ADC disable action\n");
 		return ret;
 	}
 
-	indio_dev->dev.parent = &pdev->dev;
-	indio_dev->name = dev_name(&pdev->dev);
+	indio_dev->name = dev_name(dev);
 	indio_dev->modes = INDIO_DIRECT_MODE;
 	indio_dev->info = &sc27xx_info;
 	indio_dev->channels = sc27xx_channels;
 	indio_dev->num_channels = ARRAY_SIZE(sc27xx_channels);
-	ret = devm_iio_device_register(&pdev->dev, indio_dev);
+
+	mutex_init(&sc27xx_data->lock);
+
+	ret = devm_iio_device_register(dev, indio_dev);
 	if (ret)
-		dev_err(&pdev->dev, "could not register iio (ADC)");
+		dev_err(dev, "could not register iio (ADC)");
 
 	return ret;
 }
@@ -873,6 +952,7 @@ static const struct of_device_id sc27xx_adc_of_match[] = {
 	{ .compatible = "sprd,sc2720-adc", .data = &sc2720_data},
 	{ }
 };
+MODULE_DEVICE_TABLE(of, sc27xx_adc_of_match);
 
 static struct platform_driver sc27xx_adc_driver = {
 	.probe = sc27xx_adc_probe,

@@ -1,20 +1,9 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Page table types definitions.
  *
  * Copyright (C) 2014 ARM Ltd.
  * Author: Catalin Marinas <catalin.marinas@arm.com>
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #ifndef __ASM_PGTABLE_TYPES_H
@@ -25,6 +14,7 @@
 typedef u64 pteval_t;
 typedef u64 pmdval_t;
 typedef u64 pudval_t;
+typedef u64 p4dval_t;
 typedef u64 pgdval_t;
 
 /*
@@ -46,6 +36,12 @@ typedef struct { pudval_t pud; } pud_t;
 #define __pud(x)	((pud_t) { (x) } )
 #endif
 
+#if CONFIG_PGTABLE_LEVELS > 4
+typedef struct { p4dval_t p4d; } p4d_t;
+#define p4d_val(x)	((x).p4d)
+#define __p4d(x)	((p4d_t) { (x) } )
+#endif
+
 typedef struct { pgdval_t pgd; } pgd_t;
 #define pgd_val(x)	((x).pgd)
 #define __pgd(x)	((pgd_t) { (x) } )
@@ -55,13 +51,11 @@ typedef struct { pteval_t pgprot; } pgprot_t;
 #define __pgprot(x)	((pgprot_t) { (x) } )
 
 #if CONFIG_PGTABLE_LEVELS == 2
-#define __ARCH_USE_5LEVEL_HACK
 #include <asm-generic/pgtable-nopmd.h>
 #elif CONFIG_PGTABLE_LEVELS == 3
-#define __ARCH_USE_5LEVEL_HACK
 #include <asm-generic/pgtable-nopud.h>
 #elif CONFIG_PGTABLE_LEVELS == 4
-#include <asm-generic/5level-fixup.h>
+#include <asm-generic/pgtable-nop4d.h>
 #endif
 
 #endif	/* __ASM_PGTABLE_TYPES_H */

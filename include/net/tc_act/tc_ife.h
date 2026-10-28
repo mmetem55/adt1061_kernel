@@ -5,16 +5,21 @@
 #include <net/act_api.h>
 #include <linux/etherdevice.h>
 #include <linux/rtnetlink.h>
-#include <linux/module.h>
 
-struct tcf_ife_info {
-	struct tc_action common;
+struct module;
+
+struct tcf_ife_params {
 	u8 eth_dst[ETH_ALEN];
 	u8 eth_src[ETH_ALEN];
 	u16 eth_type;
 	u16 flags;
-	/* list of metaids allowed */
 	struct list_head metalist;
+	struct rcu_head rcu;
+};
+
+struct tcf_ife_info {
+	struct tc_action common;
+	struct tcf_ife_params __rcu *params;
 };
 #define to_ife(a) ((struct tcf_ife_info *)a)
 
@@ -41,7 +46,7 @@ struct tcf_meta_ops {
 	struct module	*owner;
 };
 
-#define MODULE_ALIAS_IFE_META(metan)   MODULE_ALIAS("ifemeta" __stringify_1(metan))
+#define MODULE_ALIAS_IFE_META(metan)   MODULE_ALIAS("ife-meta-" metan)
 
 int ife_get_meta_u32(struct sk_buff *skb, struct tcf_meta_info *mi);
 int ife_get_meta_u16(struct sk_buff *skb, struct tcf_meta_info *mi);

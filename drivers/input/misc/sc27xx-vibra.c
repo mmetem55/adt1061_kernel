@@ -3,12 +3,13 @@
  * Copyright (C) 2018 Spreadtrum Communications Inc.
  */
 
-#include <linux/module.h>
-#include <linux/of_address.h>
-#include <linux/of_device.h>
-#include <linux/platform_device.h>
-#include <linux/regmap.h>
+#include <linux/device.h>
 #include <linux/input.h>
+#include <linux/mod_devicetable.h>
+#include <linux/module.h>
+#include <linux/platform_device.h>
+#include <linux/property.h>
+#include <linux/regmap.h>
 #include <linux/workqueue.h>
 
 #define CUR_DRV_CAL_SEL			GENMASK(13, 12)
@@ -34,19 +35,19 @@ struct vibra_info {
 	bool			enabled;
 };
 
-struct sc27xx_vibra_data sc2731_data = {
+static const struct sc27xx_vibra_data sc2731_data = {
 	.cur_drv_cal_sel = CUR_DRV_CAL_SEL,
 	.slp_pd_en = SLP_LDOVIBR_PD_EN,
 	.ldo_pd = LDO_VIBR_PD,
 };
 
-struct sc27xx_vibra_data sc2730_data = {
+static const struct sc27xx_vibra_data sc2730_data = {
 	.cur_drv_cal_sel = SC2730_CUR_DRV_CAL_SEL,
 	.slp_pd_en = SC2730_SLP_LDOVIBR_PD_EN,
 	.ldo_pd = SC2730_LDO_VIBR_PD,
 };
 
-struct sc27xx_vibra_data sc2721_data = {
+static const struct sc27xx_vibra_data sc2721_data = {
 	.cur_drv_cal_sel = CUR_DRV_CAL_SEL,
 	.slp_pd_en = SLP_LDOVIBR_PD_EN,
 	.ldo_pd = LDO_VIBR_PD,
@@ -75,7 +76,9 @@ static int sc27xx_vibra_hw_init(struct vibra_info *info)
 
 	if (!data->cur_drv_cal_sel)
 		return 0;
-	return regmap_update_bits(info->regmap, info->base, data->cur_drv_cal_sel, 0);
+
+	return regmap_update_bits(info->regmap, info->base,
+				  data->cur_drv_cal_sel, 0);
 }
 
 static void sc27xx_vibra_play_work(struct work_struct *work)
@@ -115,7 +118,7 @@ static int sc27xx_vibra_probe(struct platform_device *pdev)
 	const struct sc27xx_vibra_data *data;
 	int error;
 
-	data = of_device_get_match_data(&pdev->dev);
+	data = device_get_match_data(&pdev->dev);
 	if (!data) {
 		dev_err(&pdev->dev, "no matching driver data found\n");
 		return -EINVAL;
@@ -176,9 +179,9 @@ static int sc27xx_vibra_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id sc27xx_vibra_of_match[] = {
-	{ .compatible = "sprd,sc2731-vibrator", .data = &sc2731_data },
-	{ .compatible = "sprd,sc2730-vibrator", .data = &sc2730_data },
 	{ .compatible = "sprd,sc2721-vibrator", .data = &sc2721_data },
+	{ .compatible = "sprd,sc2730-vibrator", .data = &sc2730_data },
+	{ .compatible = "sprd,sc2731-vibrator", .data = &sc2731_data },
 	{}
 };
 MODULE_DEVICE_TABLE(of, sc27xx_vibra_of_match);

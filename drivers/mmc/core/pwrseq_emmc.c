@@ -1,9 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (C) 2015, Samsung Electronics Co., Ltd.
  *
  * Author: Marek Szyprowski <m.szyprowski@samsung.com>
- *
- * License terms: GNU General Public License (GPL) version 2
  *
  * Simple eMMC hardware reset provider
  */
@@ -91,14 +90,12 @@ static int mmc_pwrseq_emmc_probe(struct platform_device *pdev)
 	return mmc_pwrseq_register(&pwrseq->pwrseq);
 }
 
-static int mmc_pwrseq_emmc_remove(struct platform_device *pdev)
+static void mmc_pwrseq_emmc_remove(struct platform_device *pdev)
 {
 	struct mmc_pwrseq_emmc *pwrseq = platform_get_drvdata(pdev);
 
 	unregister_restart_handler(&pwrseq->reset_nb);
 	mmc_pwrseq_unregister(&pwrseq->pwrseq);
-
-	return 0;
 }
 
 static const struct of_device_id mmc_pwrseq_emmc_of_match[] = {
@@ -110,7 +107,7 @@ MODULE_DEVICE_TABLE(of, mmc_pwrseq_emmc_of_match);
 
 static struct platform_driver mmc_pwrseq_emmc_driver = {
 	.probe = mmc_pwrseq_emmc_probe,
-	.remove = mmc_pwrseq_emmc_remove,
+	.remove_new = mmc_pwrseq_emmc_remove,
 	.driver = {
 		.name = "pwrseq_emmc",
 		.of_match_table = mmc_pwrseq_emmc_of_match,
@@ -118,4 +115,5 @@ static struct platform_driver mmc_pwrseq_emmc_driver = {
 };
 
 module_platform_driver(mmc_pwrseq_emmc_driver);
+MODULE_DESCRIPTION("Hardware reset support for eMMC");
 MODULE_LICENSE("GPL v2");

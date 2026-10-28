@@ -1,0 +1,1625 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+
+load(
+    "//build/kernel/kleaf:kernel.bzl",
+    "ddk_module",
+    "kernel_module_group",
+    "kernel_modules_install",
+)
+
+package(default_visibility = ["//visibility:public"])
+
+_KERNEL_BUILD = "//common/adt1061:adt1061_kernel"
+# The vendor Kconfig symbol is not part of the GKI config; the sprd_mailbox
+# module provides the mailbox IPI backend that sipc/audio-sipc select on it.
+_ADT1061_COPTS = ["-DCONFIG_SPRD_MAILBOX=1"]
+
+ddk_module(
+    name = "sprd_hw_cpufreq",
+    srcs = [
+        "sprd_hw_cpufreq/sprd-cpufreq-common.c",
+        "sprd_hw_cpufreq/sprd-cpufreqhw.c",
+    ],
+    out = "sprd_hw_cpufreq.ko",
+    hdrs = glob(["sprd_hw_cpufreq/*.h"]),
+    includes = ["sprd_hw_cpufreq"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_hw_cpufreq_normal",
+    srcs = [
+        "sprd_hw_cpufreq_normal/sprd-hwdvfs-archdata.c",
+        "sprd_hw_cpufreq_normal/sprd-hwdvfs-normal.c",
+        "sprd_hw_cpufreq_normal/sprd-sysfs-normal.c",
+    ],
+    out = "sprd_hw_cpufreq_normal.ko",
+    hdrs = glob(["sprd_hw_cpufreq_normal/*.h"]),
+    includes = ["sprd_hw_cpufreq_normal"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+    deps = [":sprd_hw_cpufreq"],
+)
+
+ddk_module(
+    name = "sprd_cpu_hotplug",
+    srcs = [
+        "sprd_cpu_hotplug/sprd_hotplug.c",
+    ],
+    out = "sprd_cpu_hotplug.ko",
+    hdrs = glob(["sprd_cpu_hotplug/*.h"]),
+    includes = ["sprd_cpu_hotplug"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_auto_dfs",
+    srcs = [
+        "sprd_auto_dfs/sprd_dfs_auto_drv.c",
+    ],
+    out = "sprd_auto_dfs.ko",
+    hdrs = glob(["sprd_auto_dfs/*.h"]),
+    includes = ["sprd_auto_dfs"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+    deps = [":sprd_sipc"],
+)
+
+ddk_module(
+    name = "sprd_scene_devfreq",
+    srcs = [
+        "sprd_scene_devfreq/sprd_scene_governor.c",
+    ],
+    out = "sprd_scene_devfreq.ko",
+    hdrs = glob(["sprd_scene_devfreq/*.h"]),
+    includes = ["sprd_scene_devfreq"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+    deps = [":sprd_auto_dfs"],
+)
+
+ddk_module(
+    name = "sprd_ext_vote_ums512",
+    srcs = [
+        "sprd_ext_vote_ums512/sprd_dfs_vote_ums512.c",
+    ],
+    out = "sprd_ext_vote_ums512.ko",
+    hdrs = glob(["sprd_ext_vote_ums512/*.h"]),
+    includes = ["sprd_ext_vote_ums512"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_top_dvfs",
+    srcs = [
+        "sprd_top_dvfs/sprd-top-dvfs.c",
+    ],
+    out = "sprd_top_dvfs.ko",
+    hdrs = glob(["sprd_top_dvfs/*.h"]),
+    includes = ["sprd_top_dvfs"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_apsys_dvfs",
+    srcs = [
+        "sprd_apsys_dvfs/sprd_dvfs_apsys.c",
+        "sprd_apsys_dvfs/sprd_dvfs_dpu.c",
+        "sprd_apsys_dvfs/sprd_dvfs_vdsp.c",
+        "sprd_apsys_dvfs/sprd_dvfs_vsp.c",
+        "sprd_apsys_dvfs/dpu/dpu_dvfs_roc1.c",
+        "sprd_apsys_dvfs/dpu/dpu_dvfs_sharkl5.c",
+        "sprd_apsys_dvfs/dpu/dpu_dvfs_sharkl5pro.c",
+        "sprd_apsys_dvfs/sys/apsys_dvfs_roc1.c",
+        "sprd_apsys_dvfs/sys/apsys_dvfs_sharkl5.c",
+        "sprd_apsys_dvfs/sys/apsys_dvfs_sharkl5pro.c",
+        "sprd_apsys_dvfs/vdsp/vdsp_dvfs_roc1.c",
+        "sprd_apsys_dvfs/vdsp/vdsp_dvfs_sharkl5pro.c",
+        "sprd_apsys_dvfs/vsp/vsp_dvfs_roc1.c",
+        "sprd_apsys_dvfs/vsp/vsp_dvfs_sharkl5.c",
+        "sprd_apsys_dvfs/vsp/vsp_dvfs_sharkl5pro.c",
+    ],
+    out = "sprd_apsys_dvfs.ko",
+    hdrs = glob([
+        "sprd_apsys_dvfs/*.h",
+        "sprd_apsys_dvfs/dpu/*.h",
+        "sprd_apsys_dvfs/sys/*.h",
+        "sprd_apsys_dvfs/vdsp/*.h",
+    ]),
+    includes = ["sprd_apsys_dvfs"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_agcp_dvfs",
+    srcs = [
+        "sprd_agcp_dvfs/sprd_audcp_dvfs.c",
+    ],
+    out = "sprd_agcp_dvfs.ko",
+    hdrs = glob(["sprd_agcp_dvfs/*.h"]),
+    includes = ["sprd_agcp_dvfs"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+    deps = [":sprd_audio_sipc"],
+)
+
+ddk_module(
+    name = "sprd_cp_dvfs",
+    srcs = [
+        "sprd_cp_dvfs/sprd_cp_dvfs.c",
+    ],
+    out = "sprd_cp_dvfs.ko",
+    hdrs = glob(["sprd_cp_dvfs/*.h"]),
+    includes = ["sprd_cp_dvfs"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+    deps = [":sprd_sipc"],
+)
+
+ddk_module(
+    name = "sprd_audio_sipc",
+    srcs = [
+        "sprd_audio_sipc/audio-pipe.c",
+        "sprd_audio_sipc/audio-sipc.c",
+        "sprd_audio_sipc/audio-smsg.c",
+    ],
+    out = "sprd_audio_sipc.ko",
+    hdrs = glob(["sprd_audio_sipc/*.h"]),
+    includes = ["sprd_audio_sipc"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+    deps = [
+        ":sprd_audio_mem",
+        ":sprd_mailbox",
+    ],
+)
+
+ddk_module(
+    name = "sprd_mailbox",
+    srcs = [
+        "sprd_mailbox/sprd_mailbox.c",
+        "sprd_mailbox/sprd_mailbox_r1p2.c",
+    ],
+    out = "sprd_mailbox.ko",
+    hdrs = glob(["sprd_mailbox/*.h"]),
+    includes = ["sprd_mailbox"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_sipc",
+    srcs = [
+        "sprd_sipc/sblock.c",
+        "sprd_sipc/sbuf.c",
+        "sprd_sipc/sipc.c",
+        "sprd_sipc/sipc_debugfs.c",
+        "sprd_sipc/smem.c",
+        "sprd_sipc/smsg.c",
+    ],
+    out = "sprd_sipc.ko",
+    hdrs = glob(["sprd_sipc/*.h"]),
+    includes = ["sprd_sipc"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+    deps = [":sprd_mailbox"],
+)
+
+ddk_module(
+    name = "sprd_modem_sipc",
+    srcs = [
+        "sprd_modem_sipc/modem_sipc_main.c",
+        "sprd_modem_sipc/seth.c",
+        "sprd_modem_sipc/sipx.c",
+        "sprd_modem_sipc/spipe.c",
+        "sprd_modem_sipc/spool.c",
+        "sprd_modem_sipc/swcn_blk.c",
+    ],
+    out = "sprd_modem_sipc.ko",
+    hdrs = glob(["sprd_modem_sipc/*.h"]),
+    includes = ["sprd_modem_sipc"],
+    # vendor defconfig: CONFIG_SPRD_SIPC_ZERO_COPY_SIPX=y (SBLOCK_* -> sipx_*)
+    copts = _ADT1061_COPTS + ["-DCONFIG_SPRD_SIPC_ZERO_COPY_SIPX=1"],
+    kernel_build = _KERNEL_BUILD,
+    deps = [":sprd_sipc"],
+)
+
+ddk_module(
+    name = "sprd_gpio",
+    srcs = [
+        "sprd_gpio/gpio-sprd.c",
+    ],
+    out = "sprd_gpio.ko",
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_pwm",
+    srcs = [
+        "sprd_pwm/pwm-sprd.c",
+    ],
+    out = "sprd_pwm.ko",
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_audio_mem",
+    srcs = [
+        "sprd_audio_mem/audio_mem.c",
+    ],
+    out = "sprd_audio_mem.ko",
+    hdrs = glob(["sprd_audio_mem/*.h"]),
+    includes = ["sprd_audio_mem"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_ion",
+    srcs = ["sprd_ion/sprd_ion.c"],
+    out = "sprd_ion.ko",
+    hdrs = glob([
+        "sprd_ion/*.h",
+        "sprd_ion/include/*.h",
+    ]),
+    includes = [
+        "sprd_ion",
+        "sprd_ion/include",
+    ],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+_SPRD_WCN_COPTS = _ADT1061_COPTS + [
+    "-DCONFIG_SC23XX=1",
+    "-DCONFIG_UMW2652=1",
+    "-DCONFIG_SDIOHAL=1",
+    "-DCONFIG_WCN_SLP=1",
+    "-DCONFIG_WCN_BOOT=1",
+    "-DCONFIG_WCN_UTILS=1",
+]
+
+ddk_module(
+    name = "sprd_wcn",
+    srcs = [
+        "sprd_wcn/wcn_bus.c",
+        "sprd_wcn/sdio/sdio_v3.c",
+        "sprd_wcn/sdio/sdiohal_common.c",
+        "sprd_wcn/sdio/sdiohal_ctl.c",
+        "sprd_wcn/sdio/sdiohal_main.c",
+        "sprd_wcn/sdio/sdiohal_rx.c",
+        "sprd_wcn/sdio/sdiohal_tx.c",
+        "sprd_wcn/sleep/sdio_int.c",
+        "sprd_wcn/sleep/slp_mgr.c",
+        "sprd_wcn/sleep/slp_sdio.c",
+        "sprd_wcn/sleep/slp_test.c",
+        "sprd_wcn/platform/wcn_boot.c",
+        "sprd_wcn/platform/wcn_dump.c",
+        "sprd_wcn/platform/bufring.c",
+        "sprd_wcn/platform/wcn_txrx.c",
+        "sprd_wcn/platform/wcn_op.c",
+        "sprd_wcn/platform/wcn_misc.c",
+        "sprd_wcn/platform/wcn_parn_parser.c",
+        "sprd_wcn/platform/rdc_debug.c",
+        "sprd_wcn/platform/wcn_log.c",
+        "sprd_wcn/platform/wcn_procfs.c",
+        "sprd_wcn/platform/mem_pd_mgr.c",
+        "sprd_wcn/platform/wcn_debugfs.c",
+        "sprd_wcn/platform/gnss/gnss_common_ctl.c",
+        "sprd_wcn/platform/gnss/gnss_pmnotify_ctl.c",
+        "sprd_wcn/platform/gnss/gnss_dbg.c",
+        "sprd_wcn/platform/gnss/gnss_dump.c",
+    ],
+    out = "sprd_wcn.ko",
+    hdrs = glob([
+        "sprd_wcn/*.h",
+        "sprd_wcn/include/*.h",
+        "sprd_wcn/sdio/*.h",
+        "sprd_wcn/sleep/*.h",
+        "sprd_wcn/platform/*.h",
+        "sprd_wcn/platform/rf/*.h",
+        "sprd_wcn/platform/gnss/*.h",
+    ]),
+    includes = [
+        "sprd_wcn",
+        "sprd_wcn/include",
+        "sprd_wcn/sdio",
+        "sprd_wcn/sleep",
+        "sprd_wcn/platform",
+        "sprd_wcn/platform/gnss",
+    ],
+    copts = _SPRD_WCN_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+_SPRD_WLAN_COPTS = _ADT1061_COPTS + [
+    "-DSC2355_FTR",
+    "-DSC2355_TX_FILTER",
+    "-DSC2355_QOS_MAP",
+    "-DIBSS_SUPPORT",
+    "-DIBSS_RSN_SUPPORT",
+    "-DNAN_SUPPORT",
+    "-DRTT_SUPPORT",
+    "-DSC2355_RX_NO_LOOP",
+    "-DACS_SUPPORT",
+    "-DSC2355_HW_CSUM",
+    "-DWMMAC_WFA_CERTIFICATION",
+    "-DCOMPAT_SAMPILE_CODE",
+    "-DRND_MAC_SUPPORT",
+    "-DSOFTAP_HOOK",
+    "-DATCMD_ASSERT",
+    "-DTCPACK_DELAY_SUPPORT",
+    "-DSPLIT_STACK",
+]
+
+ddk_module(
+    name = "sprd_wlan",
+    srcs = [
+        "sprd_wlan/api_version.c",
+        "sprd_wlan/cfg80211.c",
+        "sprd_wlan/cmdevt.c",
+        "sprd_wlan/core_sc2355.c",
+        "sprd_wlan/debug.c",
+        "sprd_wlan/defrag.c",
+        "sprd_wlan/ibss.c",
+        "sprd_wlan/if_sc2355.c",
+        "sprd_wlan/main.c",
+        "sprd_wlan/mm.c",
+        "sprd_wlan/msg.c",
+        "sprd_wlan/nan.c",
+        "sprd_wlan/npi.c",
+        "sprd_wlan/qos.c",
+        "sprd_wlan/reorder.c",
+        "sprd_wlan/rf_marlin3.c",
+        "sprd_wlan/rnd_mac_addr.c",
+        "sprd_wlan/rtt.c",
+        "sprd_wlan/rx_msg_sc2355.c",
+        "sprd_wlan/softap_hook.c",
+        "sprd_wlan/tcp_ack.c",
+        "sprd_wlan/tracer.c",
+        "sprd_wlan/tx_msg_sc2355.c",
+        "sprd_wlan/txrx.c",
+        "sprd_wlan/vendor.c",
+        "sprd_wlan/work.c",
+    ],
+    out = "sprd_wlan.ko",
+    hdrs = glob([
+        "sprd_wlan/*.h",
+        "sprd_wlan/**/*.h",
+    ]),
+    includes = [
+        "sprd_wlan",
+    ],
+    copts = _SPRD_WLAN_COPTS,
+    kernel_build = _KERNEL_BUILD,
+    deps = [
+        ":sprd_wcn",
+    ],
+)
+
+ddk_module(
+    name = "sprd_bt",
+    srcs = [
+        "sprd_bt/dump.c",
+        "sprd_bt/lpm.c",
+        "sprd_bt/rfkill.c",
+        "sprd_bt/tty.c",
+        "sprd_bt/alignment/sitm.c",
+    ],
+    out = "sprd_bt.ko",
+    hdrs = glob([
+        "sprd_bt/*.h",
+        "sprd_bt/**/*.h",
+        ]),
+    includes = [
+        "sprd_bt",
+        ],
+    copts = [
+        "-DDEBUG",
+    ],
+    kernel_build = _KERNEL_BUILD,
+    deps = [":sprd_wcn"],
+)
+
+ddk_module(
+    name = "sprd_fm",
+    srcs = [
+        "sprd_fm/fm_rf_marlin3.c",
+        "sprd_fm/fmdrv_main.c",
+        "sprd_fm/fmdrv_ops.c",
+        "sprd_fm/fmdrv_rds_parser.c",
+    ],
+    out = "sprd_fm.ko",
+    hdrs = glob([
+        "sprd_fm/*.h",
+    ]),
+    includes = [
+        "sprd_fm",
+    ],
+    copts = [
+        "-DDEBUG",
+    ],
+    kernel_build = _KERNEL_BUILD,
+    deps = [":sprd_wcn"],
+)
+
+ddk_module(
+    name = "sprd_npu",
+    srcs = [
+        "sprd_npu/common.c",
+        "sprd_npu/pi_library_load.c",
+        "sprd_npu/vdsp_dump.c",
+        "sprd_npu/vdsp_dvfs.c",
+        "sprd_npu/vdsp_hw.c",
+        "sprd_npu/vdsp_ipi_drv.c",
+        "sprd_npu/vdsp_log.c",
+        "sprd_npu/vdsp_smem.c",
+        "sprd_npu/xrp_firmware.c",
+        "sprd_npu/xrp_library_loader.c",
+        "sprd_npu/xvp_main.c",
+    ],
+    out = "sprd_npu.ko",
+    hdrs = glob([
+        "sprd_npu/*.h",
+        "sprd_npu/include/*.h",
+    ]),
+    includes = [
+        "sprd_npu",
+    ],
+    copts = [
+        "-DDEBUG",
+        "-DKERNEL_VERSION_612",
+        "-DCONFIG_COMPAT",
+        "-DUNSUPPORT_FACEID",
+    ],
+    kernel_build = _KERNEL_BUILD,
+    deps = [
+        ":sprd_ion",
+        ":sprd_iommu",
+        ":sprd_apsys_dvfs",
+    ],
+)
+
+ddk_module(
+    name = "sprd_ims_bridge",
+    srcs = [
+        "sprd_ims_bridge/imsbr_main.c",
+        "sprd_ims_bridge/imsbr_hooks.c",
+        "sprd_ims_bridge/imsbr_sipc.c",
+        "sprd_ims_bridge/imsbr_packet.c",
+        "sprd_ims_bridge/imsbr_core.c",
+        "sprd_ims_bridge/imsbr_netlink.c",
+        "sprd_ims_bridge/imsbr_test.c",
+    ],
+    out = "sprd_ims_bridge.ko",
+    hdrs = glob([
+        "sprd_ims_bridge/*.h",
+    ]),
+    includes = [
+        "sprd_ims_bridge",
+    ],
+    kernel_build = _KERNEL_BUILD,
+    deps = [
+        ":sprd_sipc",
+        ":sprd_modem_sipc",
+    ],
+)
+
+ddk_module(
+    name = "sprd_cproc",
+    srcs = [
+        "sprd_cproc/sprd_cproc.c",
+    ],
+    out = "sprd_cproc.ko",
+    hdrs = glob(["sprd_cproc/*.h"]),
+    includes = ["sprd_cproc"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+    deps = [":sprd_sipc"],
+)
+
+ddk_module(
+    name = "sprd_iq",
+    srcs = [
+        "sprd_iq/sprd_iq.c",
+    ],
+    out = "sprd_iq.ko",
+    hdrs = glob(["sprd_iq/*.h"]),
+    includes = ["sprd_iq"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+    deps = [":sprd_sipc"],
+)
+
+ddk_module(
+    name = "sprd_vsp",
+    srcs = [
+        "sprd_vsp/sprd_vsp.c",
+        "sprd_vsp/sprd_vsp_pw_domain.c",
+        "sprd_vsp/vsp_common.c",
+        "sprd_vsp/vsp_isr_func.c",
+    ],
+    out = "sprd_vsp.ko",
+    hdrs = glob(["sprd_vsp/*.h"]),
+    includes = ["sprd_vsp"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+    deps = [
+        ":sprd_agcp_dvfs",
+        ":sprd_apsys_dvfs",
+        ":sprd_ion",
+        ":sprd_iommu",
+    ],
+)
+
+ddk_module(
+    name = "sprd_jpg",
+    srcs = [
+        "sprd_jpg/sprd_jpg.c",
+        "sprd_jpg/sprd_jpg_common.c",
+    ],
+    out = "sprd_jpg.ko",
+    hdrs = glob(["sprd_jpg/*.h"]),
+    includes = ["sprd_jpg"],
+    copts = _ADT1061_COPTS + ["-DCONFIG_SPRD_CAM_PW_DOMAIN_R7P0=1"],
+    kernel_build = _KERNEL_BUILD,
+    deps = [
+        ":sprd_mm_domain",
+        ":sprd_agcp_dvfs",
+        ":sprd_apsys_dvfs",
+        ":sprd_ion",
+        ":sprd_iommu",
+    ],
+)
+
+ddk_module(
+    name = "sprd_agdsp_access",
+    srcs = [
+        "sprd_agdsp_access/agdsp_access.c",
+    ],
+    out = "sprd_agdsp_access.ko",
+    hdrs = glob(["sprd_agdsp_access/*.h"]),
+    includes = ["sprd_agdsp_access"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+    deps = [
+        ":sprd_mailbox",
+        ":sprd_sipc",
+    ],
+)
+
+ddk_module(
+    name = "sprd_audio_dsp",
+    srcs = [
+        "sprd_audio_dsp/audio_dsp_dump.c",
+        "sprd_audio_dsp/audio_sblock.c",
+    ],
+    out = "sprd_audio_dsp.ko",
+    hdrs = glob(["sprd_audio_dsp/*.h"]),
+    includes = ["sprd_audio_dsp"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+    deps = [
+        ":sprd_sipc",
+        ":sprd_audio_sipc",
+        ":sprd_audio_mem",
+        ":sprd_agdsp_access",
+    ],
+)
+
+ddk_module(
+    name = "sprd_audio_mct",
+    srcs = [
+        "sprd_audio_mct/mcdt_hw.c",
+    ],
+    out = "sprd_audio_mct.ko",
+    hdrs = glob(["sprd_audio_mct/*.h"]),
+    includes = ["sprd_audio_mct"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_audio_cpboot",
+    srcs = [
+        "sprd_audio_cpboot/sprd_audcp_boot.c",
+    ],
+    out = "sprd_audio_cpboot.ko",
+    hdrs = glob(["sprd_audio_cpboot/*.h"]),
+    includes = ["sprd_audio_cpboot"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+    deps = [
+        ":sprd_sipc",
+        ":sprd_audio_sipc",
+        ":sprd_audio_mem",
+    ],
+)
+
+_SPRD_SOUND_HDRS = glob([
+    "**/*.h",
+])
+
+_SPRD_SOUND_DEPS = [
+    ":sprd_agdsp_access",
+    ":sprd_audio_dsp",
+    ":sprd_audio_mct",
+    ":sprd_audio_cpboot",
+    ":sprd_audio_sipc",
+    ":sprd_sipc",
+    ":snd_soc_sprd",
+    ":sprd_audio_mem",
+]
+
+ddk_module(
+    name = "snd_soc_sprd",
+    srcs = [
+        "snd_soc_sprd/sprd-asoc-common.c",
+        "snd_soc_sprd/sprd-asoc-card-utils.c",
+        "snd_soc_sprd/sprd-asoc-card-utils-legacy.c",
+        "snd_soc_sprd/sprd-asoc-card-utils-hook.c",
+    ] + glob(
+        [
+            "snd_soc_sprd/platform/**/*.c",
+            "snd_soc_sprd/codec/dummy-codec/**/*.c",
+        ],
+        exclude = [
+            "snd_soc_sprd/platform/sprd-2stage-dmaengine-pcm.c",
+        ],
+    ),
+    out = "snd_soc_sprd.ko",
+    hdrs = _SPRD_SOUND_HDRS,
+    kernel_build = _KERNEL_BUILD,
+    deps = [
+        ":sprd_agdsp_access",
+        ":sprd_audio_dsp",
+        ":sprd_audio_sipc",
+        ":sprd_audio_mem",
+        ":sprd_audio_mct",
+        ":sprd_audio_cpboot",
+    ],
+)
+
+ddk_module(
+    name = "snd_soc_sprd_vbc_v4",
+    srcs = glob(
+        [
+            "snd_soc_sprd/dai/vbc/v4/**/*.c",
+        ],
+        exclude = [
+            "snd_soc_sprd/dai/vbc/v4/vbc-codec.c",
+        ],
+    ),
+    out = "snd_soc_sprd_vbc_v4.ko",
+    hdrs = _SPRD_SOUND_HDRS + ["snd_soc_sprd/dai/vbc/v4/vbc-codec.c"],
+    kernel_build = _KERNEL_BUILD,
+    deps = _SPRD_SOUND_DEPS
+)
+
+ddk_module(
+    name = "snd_soc_sprd_vaudio",
+    srcs = glob([
+        "snd_soc_sprd/dai/vaudio/**/*.c",
+    ]),
+    out = "snd_soc_sprd_vaudio.ko",
+    hdrs = _SPRD_SOUND_HDRS,
+    kernel_build = _KERNEL_BUILD,
+    deps = _SPRD_SOUND_DEPS
+)
+
+ddk_module(
+    name = "snd_soc_sprd_i2s",
+    srcs = glob([
+        "snd_soc_sprd/dai/i2s/**/*.c",
+    ]),
+    out = "snd_soc_sprd_i2s.ko",
+    hdrs = _SPRD_SOUND_HDRS,
+    copts = _ADT1061_COPTS + ["-DCONFIG_SND_SOC_SPRD_I2S"],
+    kernel_build = _KERNEL_BUILD,
+    deps = _SPRD_SOUND_DEPS
+)
+
+ddk_module(
+    name = "snd_soc_sprd_codec_sc2730",
+    srcs = glob([
+        "snd_soc_sprd/codec/sprd/sc2730/**/*.c",
+    ]),
+    out = "snd_soc_sprd_codec_sc2730.ko",
+    hdrs = _SPRD_SOUND_HDRS,
+    kernel_build = _KERNEL_BUILD,
+    copts = _ADT1061_COPTS + ["-DCONFIG_SND_SOC_SPRD_CODEC_SC2730"],
+    deps = _SPRD_SOUND_DEPS
+)
+
+ddk_module(
+    name = "snd_soc_sprd_codec_sc2721",
+    srcs = glob([
+        "snd_soc_sprd/codec/sprd/sc2721/**/*.c",
+    ]),
+    out = "snd_soc_sprd_codec_sc2721.ko",
+    hdrs = _SPRD_SOUND_HDRS,
+    kernel_build = _KERNEL_BUILD,
+    copts = _ADT1061_COPTS + ["-DCONFIG_SND_SOC_SPRD_CODEC_SC2721"],
+    deps = _SPRD_SOUND_DEPS
+)
+
+ddk_module(
+    name = "snd_soc_sprd_pa_ucp1301",
+    srcs = glob([
+        "snd_soc_sprd/codec/sprd/ucp1301/**/*.c",
+    ]),
+    out = "snd_soc_sprd_pa_ucp1301.ko",
+    hdrs = _SPRD_SOUND_HDRS,
+    kernel_build = _KERNEL_BUILD,
+    deps = _SPRD_SOUND_DEPS
+)
+
+ddk_module(
+    name = "snd_soc_sprd_vbc_v4_sc2730",
+    srcs = [
+        "snd_soc_sprd/vbc-rxpx-codec-sc27xx.c",
+    ],
+    out = "vbc-rxpx-codec-sc2730.ko",
+    hdrs = _SPRD_SOUND_HDRS,
+    kernel_build = _KERNEL_BUILD,
+    deps = _SPRD_SOUND_DEPS
+)
+
+ddk_module(
+    name = "snd_soc_sprd_r1p0v3_sc2721",
+    srcs = [
+        "snd_soc_sprd/vbc-rxpx-codec-sc27xx.c",
+    ],
+    out = "vbc-rxpx-codec-sc2721.ko",
+    hdrs = _SPRD_SOUND_HDRS,
+    kernel_build = _KERNEL_BUILD,
+    deps = _SPRD_SOUND_DEPS
+)
+
+ddk_module(
+    name = "snd_soc_sprd_i2s_dummy",
+    srcs = [
+        "snd_soc_sprd/i2s-r0p0-dummy-codec.c",
+    ],
+    out = "snd-soc-i2s-dummy.ko",
+    hdrs = _SPRD_SOUND_HDRS,
+    kernel_build = _KERNEL_BUILD,
+    deps = _SPRD_SOUND_DEPS
+)
+
+ddk_module(
+    name = "sprd_iommu",
+    srcs = [
+        "sprd_iommu/sprd_iommu_core.c",
+        "sprd_iommu/sprd_iommu_sysfs.c",
+        "sprd_iommu/drv/sprd_iommuex_ops.c",
+        "sprd_iommu/drv/sprd_iommuvau_ops.c",
+        "sprd_iommu/drv/api/sprd_iommu_api.c",
+        "sprd_iommu/drv/cll/sprd_iommuex_cll.c",
+        "sprd_iommu/drv/cll/sprd_iommuvau_cll.c",
+        "sprd_iommu/drv/com/sprd_com.c",
+        "sprd_iommu/drv/hal/sprd_iommuex_hal_register.c",
+        "sprd_iommu/drv/hal/sprd_iommuvau_hal_register.c",
+        "sprd_iommu/drv/osal/sprd_osal.c",
+    ],
+    out = "sprd_iommu.ko",
+    hdrs = glob([
+        "sprd_iommu/*.h",
+        "sprd_iommu/include/*.h",
+        "sprd_iommu/drv/*.h",
+        "sprd_iommu/drv/**/*.h",
+    ]),
+    includes = [
+        "sprd_iommu",
+        "sprd_iommu/include",
+        "sprd_iommu/drv",
+        "sprd_iommu/drv/inc",
+        "sprd_iommu/drv/osal",
+        "sprd_iommu/drv/com",
+        "sprd_iommu/drv/api",
+        "sprd_iommu/drv/cll",
+        "sprd_iommu/drv/hal",
+    ],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+    deps = [":sprd_ion"],
+)
+
+_SPRD_DRM_COPTS = _ADT1061_COPTS + [
+    "-DCONFIG_DRM_SPRD_GSP=1",
+]
+
+ddk_module(
+    name = "sprd_drm",
+    srcs = [
+        "sprd_drm/sprd_drm.c",
+        "sprd_drm/sprd_gem.c",
+        "sprd_drm/sprd_dpu.c",
+        "sprd_drm/sprd_dsi.c",
+        "sprd_drm/sprd_dphy.c",
+        "sprd_drm/sprd_panel.c",
+        "sprd_drm/sprd_bl.c",
+        "sprd_drm/sprd_corner.c",
+        "sprd_drm/disp_lib.c",
+        "sprd_drm/dummy/dummy_crtc.c",
+        "sprd_drm/dummy/dummy_connector.c",
+        "sprd_drm/cabc/bl_decision.c",
+        "sprd_drm/cabc/cabc.c",
+        "sprd_drm/cabc/cabc_table.c",
+        "sprd_drm/cabc/gain_compensation.c",
+        "sprd_drm/cabc/scene_detect.c",
+        "sprd_drm/dpu/dpu_r4p0.c",
+        "sprd_drm/dsi/sprd_dsi_api.c",
+        "sprd_drm/dsi/core/dsi_ctrl_r1p0.c",
+        "sprd_drm/dsi/core/dsi_ctrl_r1p0_ppi.c",
+        "sprd_drm/dphy/sprd_dphy_api.c",
+        "sprd_drm/dphy/pll/megacores_sharkl5.c",
+        "sprd_drm/sysfs/sysfs_class.c",
+        "sprd_drm/sysfs/sysfs_dpu.c",
+        "sprd_drm/sysfs/sysfs_dsi.c",
+        "sprd_drm/sysfs/sysfs_dphy.c",
+        "sprd_drm/sysfs/sysfs_panel.c",
+        "sprd_drm/sharkl5Pro/global_dphy.c",
+        "sprd_drm/sharkl5Pro/global_dpu.c",
+        "sprd_drm/sharkl5Pro/global_dsi.c",
+        "sprd_drm/gsp/gsp_core.c",
+        "sprd_drm/gsp/gsp_dev.c",
+        "sprd_drm/gsp/gsp_interface.c",
+        "sprd_drm/gsp/gsp_kcfg.c",
+        "sprd_drm/gsp/gsp_layer.c",
+        "sprd_drm/gsp/gsp_sync.c",
+        "sprd_drm/gsp/gsp_sysfs.c",
+        "sprd_drm/gsp/gsp_workqueue.c",
+        "sprd_drm/gsp/gsp_r8p0/gsp_r8p0_coef_cal.c",
+        "sprd_drm/gsp/gsp_r8p0/gsp_r8p0_core.c",
+        "sprd_drm/gsp/gsp_interface/gsp_interface_sharkl5pro.c",
+    ],
+    out = "sprd_drm.ko",
+    hdrs = glob([
+        "sprd_drm/*.h",
+        "sprd_drm/cabc/*.h",
+        "sprd_drm/dpu/*.h",
+        "sprd_drm/dsi/*.h",
+        "sprd_drm/dsi/core/*.h",
+        "sprd_drm/dphy/*.h",
+        "sprd_drm/dphy/pll/*.h",
+        "sprd_drm/sysfs/*.h",
+        "sprd_drm/gsp/*.h",
+        "sprd_drm/gsp/gsp_r8p0/*.h",
+        "sprd_drm/gsp/gsp_interface/*.h",
+        "sprd_drm/uapi/drm/*.h",
+        "sprd_drm/drm/*.h",
+    ]),
+    includes = [
+        "sprd_drm",
+        "sprd_drm/cabc",
+        "sprd_drm/dpu",
+        "sprd_drm/dsi",
+        "sprd_drm/dsi/core",
+        "sprd_drm/dphy",
+        "sprd_drm/dphy/pll",
+        "sprd_drm/sysfs",
+        "sprd_drm/gsp",
+        "sprd_drm/gsp/gsp_r8p0",
+        "sprd_drm/gsp/gsp_interface",
+    ],
+    copts = _SPRD_DRM_COPTS,
+    kernel_build = _KERNEL_BUILD,
+    deps = [
+        ":sprd_ion",
+        ":sprd_iommu",
+    ],
+)
+
+
+ddk_module(
+    name = "sprd_serial",
+    srcs = glob(["sprd_serial/*.c"]),
+    out = "sprd_serial.ko",
+    hdrs = glob(["sprd_serial/*.h"]),
+    includes = ["sprd_serial"],
+    copts = _ADT1061_COPTS + [
+        "-DCONFIG_SERIAL_SPRD_CONSOLE=1",
+        "-DCONFIG_MAGIC_SYSRQ=1",
+        "-DCONFIG_CONSOLE_POLL=1",
+        "-DCONFIG_OF=1",
+        "-DCONFIG_PM_SLEEP=1",
+    ],
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_clk_core",
+    srcs = [
+        "sprd_common_clk/common.c",
+        "sprd_common_clk/gate.c",
+        "sprd_common_clk/mux.c",
+        "sprd_common_clk/div.c",
+        "sprd_common_clk/composite.c",
+        "sprd_common_clk/pll.c",
+    ],
+    out = "sprd_clk.ko",
+    hdrs = glob([
+        "sprd_common_clk/*.h",
+        "sprd_common_clk/clock/*.h",
+    ]),
+    includes = ["sprd_common_clk"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+    deps = [":sprd_sip_fw"],
+)
+
+ddk_module(
+    name = "sharkl5pro_clk",
+    srcs = ["sprd_common_clk/sharkl5pro-clk.c"],
+    out = "sharkl5pro_clk.ko",
+    hdrs = glob(["sprd_common_clk/*.h"]),
+    includes = ["sprd_common_clk"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+    deps = [":sprd_clk_core"],
+)
+
+ddk_module(
+    name = "sprd_7sreset",
+    srcs = glob(["sprd_7sreset/*.c"]),
+    out = "sprd_7sreset.ko",
+    hdrs = glob(["sprd_7sreset/*.h"]),
+    includes = ["sprd_7sreset"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_core_ctl",
+    srcs = glob(["sprd_core_ctl/*.c"]),
+    out = "sprd_core_ctl.ko",
+    hdrs = glob(["sprd_core_ctl/*.h"]),
+    includes = ["sprd_core_ctl"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_hwfeature",
+    srcs = glob(["sprd_hwfeature/*.c"]),
+    out = "sprd_hwfeature.ko",
+    hdrs = glob(["sprd_hwfeature/*.h"]),
+    includes = ["sprd_hwfeature"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_hwspinlock",
+    srcs = glob(["sprd_hwspinlock/*.c"]),
+    out = "sprd_hwspinlock.ko",
+    hdrs = glob(["sprd_hwspinlock/*.h"]),
+    includes = ["sprd_hwspinlock"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_mem_overlay_check",
+    srcs = glob(["sprd_mem_overlay_check/*.c"]),
+    out = "sprd_mem_overlay_check.ko",
+    hdrs = glob(["sprd_mem_overlay_check/*.h"]),
+    includes = ["sprd_mem_overlay_check"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_pmic_syscon",
+    srcs = glob(["sprd_pmic_syscon/*.c"]),
+    out = "sprd_pmic_syscon.ko",
+    hdrs = glob(["sprd_pmic_syscon/*.h"]),
+    includes = ["sprd_pmic_syscon"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_sip_fw",
+    srcs = glob(["sprd_sip_fw/*.c"]),
+    out = "sprd_sip_fw.ko",
+    hdrs = glob(["sprd_sip_fw/*.h"]),
+    includes = ["sprd_sip_fw"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_systimer",
+    srcs = glob(["sprd_systimer/*.c"]),
+    out = "sprd_systimer.ko",
+    hdrs = glob(["sprd_systimer/*.h"]),
+    includes = ["sprd_systimer"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_sleep",
+    srcs = glob(["sprd_sleep/*.c"]),
+    out = "sprd_sleep.ko",
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_timer",
+    srcs = glob(["sprd_timer/*.c"]),
+    out = "sprd_timer.ko",
+    hdrs = glob(["sprd_timer/*.h"]),
+    includes = ["sprd_timer"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+# ---- SC2730 PMIC / platform base drivers ported from the 4.14 vendor kernel ----
+ddk_module(
+    name = "sprd_pinctrl",
+    srcs = ["sprd_pinctrl/pinctrl-sprd.c", "sprd_pinctrl/pinctrl-sprd-sharkl5Pro.c"],
+    out = "sprd_pinctrl.ko",
+    hdrs = glob(["sprd_pinctrl/*.h"]),
+    includes = ["sprd_pinctrl"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_eic",
+    srcs = ["sprd_eic/gpio-eic-sprd.c"],
+    out = "sprd_eic.ko",
+    hdrs = glob(["sprd_eic/*.h"]),
+    includes = ["sprd_eic"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_adi",
+    srcs = ["sprd_adi/spi-sprd-adi.c"],
+    out = "sprd_adi.ko",
+    hdrs = glob(["sprd_adi/*.h"]),
+    includes = ["sprd_adi"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_sc27xx_mfd",
+    srcs = ["sprd_sc27xx_mfd/sprd-sc27xx-spi.c"],
+    out = "sprd_sc27xx_mfd.ko",
+    hdrs = glob(["sprd_sc27xx_mfd/*.h"]),
+    includes = ["sprd_sc27xx_mfd"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_sc2730_regulator",
+    srcs = ["sprd_sc2730_regulator/sc2730-regulator.c"],
+    out = "sprd_sc2730_regulator.ko",
+    hdrs = glob(["sprd_sc2730_regulator/*.h"]),
+    includes = ["sprd_sc2730_regulator"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_sc27xx_adc",
+    srcs = ["sprd_sc27xx_adc/sc27xx_adc.c"],
+    out = "sprd_sc27xx_adc.ko",
+    hdrs = glob(["sprd_sc27xx_adc/*.h"]),
+    includes = ["sprd_sc27xx_adc"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_sc27xx_efuse",
+    srcs = ["sprd_sc27xx_efuse/sc27xx-efuse.c"],
+    out = "sprd_sc27xx_efuse.ko",
+    hdrs = glob(["sprd_sc27xx_efuse/*.h"]),
+    includes = ["sprd_sc27xx_efuse"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_sc27xx_rtc",
+    srcs = ["sprd_sc27xx_rtc/rtc-sc27xx.c"],
+    out = "sprd_sc27xx_rtc.ko",
+    hdrs = glob(["sprd_sc27xx_rtc/*.h"]),
+    includes = ["sprd_sc27xx_rtc"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_pmic_eic",
+    srcs = ["sprd_pmic_eic/gpio-pmic-eic-sprd.c"],
+    out = "sprd_pmic_eic.ko",
+    hdrs = glob(["sprd_pmic_eic/*.h"]),
+    includes = ["sprd_pmic_eic"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_sc27xx_poweroff",
+    srcs = ["sprd_sc27xx_poweroff/sc27xx-poweroff.c"],
+    out = "sprd_sc27xx_poweroff.ko",
+    hdrs = glob(["sprd_sc27xx_poweroff/*.h"]),
+    includes = ["sprd_sc27xx_poweroff"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_sc27xx_fgu",
+    srcs = ["sprd_sc27xx_fgu/sc27xx_fuel_gauge.c"],
+    out = "sprd_sc27xx_fgu.ko",
+    hdrs = glob(["sprd_sc27xx_fgu/*.h"]),
+    includes = ["sprd_sc27xx_fgu"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_sc2730_fchg",
+    srcs = ["sprd_sc2730_fchg/sc2730_fast_charger.c"],
+    out = "sprd_sc2730_fchg.ko",
+    hdrs = glob(["sprd_sc2730_fchg/*.h"]),
+    includes = ["sprd_sc2730_fchg"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_sc27xx_typec",
+    srcs = ["sprd_sc27xx_typec/sc27xx_typec.c"],
+    out = "sprd_sc27xx_typec.ko",
+    hdrs = glob(["sprd_sc27xx_typec/*.h"]),
+    includes = ["sprd_sc27xx_typec"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_sc27xx_tsensor",
+    srcs = ["sprd_sc27xx_tsensor/sc27xx_tsensor_thermal.c"],
+    out = "sprd_sc27xx_tsensor.ko",
+    hdrs = glob(["sprd_sc27xx_tsensor/*.h"]),
+    includes = ["sprd_sc27xx_tsensor"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_sc27xx_vibra",
+    srcs = ["sprd_sc27xx_vibra/sc27xx-vibra.c"],
+    out = "sprd_sc27xx_vibra.ko",
+    hdrs = glob(["sprd_sc27xx_vibra/*.h"]),
+    includes = ["sprd_sc27xx_vibra"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_sc27xx_bltc",
+    srcs = ["sprd_sc27xx_bltc/leds-sc27xx-bltc.c"],
+    out = "sprd_sc27xx_bltc.ko",
+    hdrs = glob(["sprd_sc27xx_bltc/*.h"]),
+    includes = ["sprd_sc27xx_bltc"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_i2c",
+    srcs = ["sprd_i2c/i2c-sprd.c"],
+    out = "sprd_i2c.ko",
+    hdrs = glob(["sprd_i2c/*.h"]),
+    includes = ["sprd_i2c"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_bq2560x",
+    srcs = ["sprd_bq2560x/bq2560x-charger.c"],
+    out = "sprd_bq2560x.ko",
+    hdrs = glob(["sprd_bq2560x/*.h"]),
+    includes = ["sprd_bq2560x"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_sdhcr11",
+    srcs = ["sprd_sdhcr11/sprd-sdhcr11.c"],
+    out = "sprd_sdhcr11.ko",
+    hdrs = glob(["sprd_sdhcr11/*.h"]),
+    includes = ["sprd_sdhcr11"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_usb_phy",
+    srcs = ["sprd_usb_phy/phy-sprd-sharkl5.c"],
+    out = "sprd_usb_phy.ko",
+    hdrs = glob(["sprd_usb_phy/*.h"]),
+    includes = ["sprd_usb_phy"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_extcon_usb_gpio",
+    srcs = ["sprd_extcon_usb_gpio/extcon-usb-gpio.c"],
+    out = "sprd_extcon_usb_gpio.ko",
+    hdrs = glob(["sprd_extcon_usb_gpio/*.h"]),
+    includes = ["sprd_extcon_usb_gpio"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_wdt",
+    srcs = ["sprd_wdt/sprd_wdt.c"],
+    out = "sprd_wdt.ko",
+    hdrs = glob(["sprd_wdt/*.h"]),
+    includes = ["sprd_wdt"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_cache_efuse",
+    srcs = ["sprd_cache_efuse/sprd_cache_efuse.c"],
+    out = "sprd_cache_efuse.ko",
+    hdrs = glob(["sprd_cache_efuse/*.h"]),
+    includes = ["sprd_cache_efuse"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_dma",
+    srcs = ["sprd_dma/sprd-dma.c"],
+    out = "sprd_dma.ko",
+    hdrs = glob(["sprd_dma/*.h"]),
+    includes = ["sprd_dma"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_spi",
+    srcs = ["sprd_spi/spi-sprd.c"],
+    out = "sprd_spi.ko",
+    hdrs = glob(["sprd_spi/*.h"]),
+    includes = ["sprd_spi"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_hw_i2c",
+    srcs = ["sprd_hw_i2c/i2c-sprd-hw.c"],
+    out = "sprd_hw_i2c.ko",
+    hdrs = glob(["sprd_hw_i2c/*.h"]),
+    includes = ["sprd_hw_i2c"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_fan53555",
+    srcs = ["sprd_fan53555/fan53555.c"],
+    out = "sprd_fan53555.ko",
+    hdrs = glob(["sprd_fan53555/*.h"]),
+    includes = ["sprd_fan53555"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_generic_adc_thermal",
+    srcs = ["sprd_generic_adc_thermal/thermal-generic-adc.c"],
+    out = "sprd_generic_adc_thermal.ko",
+    hdrs = glob(["sprd_generic_adc_thermal/*.h"]),
+    includes = ["sprd_generic_adc_thermal"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_thermal",
+    srcs = ["sprd_thermal/sprd_thermal.c"],
+    out = "sprd_thermal.ko",
+    hdrs = glob(["sprd_thermal/*.h"]),
+    includes = ["sprd_thermal"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_silead",
+    srcs = ["sprd_silead/silead.c"],
+    out = "sprd_silead.ko",
+    hdrs = glob(["sprd_silead/*.h"]),
+    includes = ["sprd_silead"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_goodix",
+    srcs = ["sprd_goodix/goodix.c", "sprd_goodix/goodix_fwupload.c"],
+    out = "sprd_goodix.ko",
+    hdrs = glob(["sprd_goodix/*.h"]),
+    includes = ["sprd_goodix"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_edt_ft5x06",
+    srcs = ["sprd_edt_ft5x06/edt-ft5x06.c"],
+    out = "sprd_edt_ft5x06.ko",
+    hdrs = glob(["sprd_edt_ft5x06/*.h"]),
+    includes = ["sprd_edt_ft5x06"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_thm_soc",
+    srcs = ["sprd_thm_soc/sprd_soc_thm.c", "sprd_thm_soc/sprd_thm_comm.c"],
+    out = "sprd_thm_soc.ko",
+    hdrs = glob(["sprd_thm_soc/*.h"]),
+    includes = ["sprd_thm_soc"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_thm_cluster0",
+    srcs = ["sprd_thm_cluster0/sprd_cluster0_thm.c", "sprd_thm_cluster0/sprd_thm_comm.c"],
+    out = "sprd_thm_cluster0.ko",
+    hdrs = glob(["sprd_thm_cluster0/*.h"]),
+    includes = ["sprd_thm_cluster0"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_thm_cluster1",
+    srcs = ["sprd_thm_cluster1/sprd_cluster1_thm.c", "sprd_thm_cluster1/sprd_thm_comm.c"],
+    out = "sprd_thm_cluster1.ko",
+    hdrs = glob(["sprd_thm_cluster1/*.h"]),
+    includes = ["sprd_thm_cluster1"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_musb",
+    srcs = ["sprd_musb/musb_core.c", "sprd_musb/musb_trace.c", "sprd_musb/musb_gadget.c", "sprd_musb/musb_gadget_ep0.c", "sprd_musb/sprd_musbhsdma.c", "sprd_musb/musb_sprd.c", "sprd_musb/musb_debugfs.c"],
+    out = "sprd_musb.ko",
+    hdrs = glob(["sprd_musb/*.h"]),
+    includes = ["sprd_musb"],
+    copts = _ADT1061_COPTS + ["-DCONFIG_USB_MUSB_GADGET=1", "-DCONFIG_USB_MUSB_SPRD=1", "-DCONFIG_USB_SPRD_DMA=1", "-DCONFIG_USB_SPRD_DMA_V3=1", "-DCONFIG_USB_MUSB_HDRC=1", "-Wno-error=implicit-fallthrough", "-Wno-error=unused-but-set-parameter", "-Wno-error=shift-count-overflow", "-Wno-error=unused-function", "-Wno-error=unused-variable"],
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_himax",
+    srcs = ["sprd_himax/himax_common.c", "sprd_himax/himax_platform.c", "sprd_himax/himax_ic_incell_core.c"],
+    out = "sprd_himax.ko",
+    hdrs = glob(["sprd_himax/*.h"]),
+    includes = ["sprd_himax"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_charger_manager",
+    srcs = ["sprd_charger_manager/charger-manager.c"],
+    out = "sprd_charger_manager.ko",
+    hdrs = glob(["sprd_charger_manager/*.h"]),
+    includes = ["sprd_charger_manager"],
+    copts = _ADT1061_COPTS + ["-DCONFIG_CHARGER_MANAGER=1"],
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "sprd_mm_domain",
+    srcs = ["sprd_mm_domain/sprd_mm_domain.c"],
+    out = "sprd_mm_domain.ko",
+    hdrs = glob(["sprd_mm_domain/*.h"]),
+    includes = ["sprd_mm_domain"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "gpu_sched",
+    srcs = [
+        "gpu_sched/sched_entity.c",
+        "gpu_sched/sched_fence.c",
+        "gpu_sched/sched_main.c",
+    ],
+    out = "gpu-sched.ko",
+    hdrs = glob(["gpu_sched/*.h"]),
+    includes = ["gpu_sched"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+)
+
+ddk_module(
+    name = "panfrost",
+    srcs = [
+        "panfrost/panfrost_devfreq.c",
+        "panfrost/panfrost_device.c",
+        "panfrost/panfrost_drv.c",
+        "panfrost/panfrost_dump.c",
+        "panfrost/panfrost_gem.c",
+        "panfrost/panfrost_gem_shrinker.c",
+        "panfrost/panfrost_gpu.c",
+        "panfrost/panfrost_job.c",
+        "panfrost/panfrost_mmu.c",
+        "panfrost/panfrost_perfcnt.c",
+    ],
+    out = "panfrost.ko",
+    hdrs = glob(["panfrost/*.h"]),
+    includes = ["panfrost"],
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+    deps = [":gpu_sched"],
+)
+
+ddk_module(
+    name = "sprd_gpu_pd",
+    srcs = ["sprd_gpu_pd/sprd_gpu_pd.c"],
+    out = "sprd_gpu_pd.ko",
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+    deps = [":sprd_hwfeature"],
+)
+
+ddk_module(
+    name = "sprd_cpu_cooling",
+    srcs = ["sprd_cpu_cooling/sprd_cpu_cooling.c"],
+    out = "sprd_cpu_cooling.ko",
+    copts = _ADT1061_COPTS,
+    kernel_build = _KERNEL_BUILD,
+    deps = [":sprd_hw_cpufreq"],
+)
+
+kernel_module_group(
+    name = "adt1061_modules",
+    srcs = [
+        ":sprd_cpu_cooling",
+        ":gpu_sched",
+        ":panfrost",
+        ":sprd_gpu_pd",
+        ":sprd_mm_domain",
+        ":sprd_charger_manager",
+        ":sprd_himax",
+        ":sprd_musb",
+        ":sprd_thm_cluster1",
+        ":sprd_thm_cluster0",
+        ":sprd_thm_soc",
+        ":sprd_edt_ft5x06",
+        ":sprd_goodix",
+        ":sprd_silead",
+        ":sprd_thermal",
+        ":sprd_generic_adc_thermal",
+        ":sprd_fan53555",
+        ":sprd_hw_i2c",
+        ":sprd_spi",
+        ":sprd_dma",
+        ":sprd_cache_efuse",
+        ":sprd_wdt",
+        ":sprd_usb_phy",
+        ":sprd_extcon_usb_gpio",
+        ":sprd_pinctrl",
+        ":sprd_eic",
+        ":sprd_adi",
+        ":sprd_sc27xx_mfd",
+        ":sprd_sc2730_regulator",
+        ":sprd_sc27xx_adc",
+        ":sprd_sc27xx_efuse",
+        ":sprd_sc27xx_rtc",
+        ":sprd_pmic_eic",
+        ":sprd_sc27xx_poweroff",
+        ":sprd_sc27xx_fgu",
+        ":sprd_sc2730_fchg",
+        ":sprd_sc27xx_typec",
+        ":sprd_sc27xx_tsensor",
+        ":sprd_sc27xx_vibra",
+        ":sprd_sc27xx_bltc",
+        ":sprd_i2c",
+        ":sprd_bq2560x",
+        ":sprd_sdhcr11",
+        ":sprd_ion",
+        ":sprd_iommu",
+        ":sprd_gpio",
+        ":sprd_pwm",
+        ":sprd_drm",
+        ":sprd_hw_cpufreq",
+        ":sprd_hw_cpufreq_normal",
+        ":sprd_cpu_hotplug",
+        ":sprd_auto_dfs",
+        ":sprd_scene_devfreq",
+        ":sprd_mailbox",
+        ":sprd_sipc",
+        ":sprd_modem_sipc",
+        ":sprd_audio_sipc",
+        ":sprd_audio_mem",
+        ":sprd_ext_vote_ums512",
+        ":sprd_top_dvfs",
+        ":sprd_apsys_dvfs",
+        ":sprd_agcp_dvfs",
+        ":sprd_cp_dvfs",
+        ":sprd_clk_core",
+        ":sharkl5pro_clk",
+        ":sprd_7sreset",
+        ":sprd_core_ctl",
+        ":sprd_hwfeature",
+        ":sprd_hwspinlock",
+        ":sprd_mem_overlay_check",
+        ":sprd_pmic_syscon",
+        ":sprd_sip_fw",
+        ":sprd_systimer",
+        ":sprd_sleep",
+        ":sprd_timer",
+        ":sprd_wcn",
+        ":sprd_wlan",
+        ":sprd_bt",
+        ":sprd_fm",
+        ":sprd_npu",
+        ":sprd_ims_bridge",
+        ":sprd_cproc",
+        ":sprd_iq",
+        ":sprd_vsp",
+        ":sprd_jpg",
+        ":sprd_agdsp_access",
+        ":sprd_audio_dsp",
+        ":sprd_audio_mct",
+        ":sprd_audio_cpboot",
+        "snd_soc_sprd",
+        "snd_soc_sprd_vbc_v4",
+        "snd_soc_sprd_vaudio",
+        "snd_soc_sprd_i2s",
+        "snd_soc_sprd_codec_sc2730",
+        "snd_soc_sprd_pa_ucp1301",
+        "snd_soc_sprd_vbc_v4_sc2730",
+        # SC2721 codec/vbc variants are not shipped: this board has an SC2730 PMIC,
+        # and both variants export the same symbols/driver name as the SC2730 ones.
+        "snd_soc_sprd_i2s_dummy",
+        # sprd_serial is intentionally not shipped: CONFIG_SERIAL_SPRD=y is
+        # already built into GKI and registers the same "sprd_serial" driver.
+    ],
+)
+
+kernel_modules_install(
+    name = "adt1061_modules_install",
+    kernel_build = _KERNEL_BUILD,
+    kernel_modules = [":adt1061_modules"],
+)

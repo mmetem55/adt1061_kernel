@@ -1,10 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * libata-pmp.c - libata port multiplier support
  *
  * Copyright (c) 2007  SUSE Linux Products GmbH
  * Copyright (c) 2007  Tejun Heo <teheo@suse.de>
- *
- * This file is released under the GPLv2.
  */
 
 #include <linux/kernel.h>
@@ -63,7 +62,7 @@ static unsigned int sata_pmp_read(struct ata_link *link, int reg, u32 *r_val)
  *	sata_pmp_write - write PMP register
  *	@link: link to write PMP register for
  *	@reg: register to write
- *	@r_val: value to write
+ *	@val: value to write
  *
  *	Write PMP register.
  *
@@ -111,13 +110,24 @@ int sata_pmp_qc_defer_cmd_switch(struct ata_queued_cmd *qc)
 {
 	struct ata_link *link = qc->dev->link;
 	struct ata_port *ap = link->ap;
+	int ret;
 
 	if (ap->excl_link == NULL || ap->excl_link == link) {
 		if (ap->nr_active_links == 0 || ata_link_active(link)) {
 			qc->flags |= ATA_QCFLAG_CLEAR_EXCL;
-			return ata_std_qc_defer(qc);
+			ret = ata_std_qc_defer(qc);
+			if (ret == ATA_DEFER_LINK)
+				return ATA_DEFER_LINK_EXCL;
+			return ret;
 		}
 
+		/*
+		 * Note: ap->excl_link contains the link that is next in line,
+		 * i.e. implicit round robin. If there is only one link
+		 * dispatching, ap->excl_link will be left unclaimed, allowing
+		 * other links to set ap->excl_link, ensuring that the currently
+		 * active link cannot queue any more.
+		 */
 		ap->excl_link = link;
 	}
 
@@ -340,7 +350,7 @@ static int sata_pmp_init_links (struct ata_port *ap, int nr_ports)
 	int i, err;
 
 	if (!pmp_link) {
-		pmp_link = kzalloc(sizeof(pmp_link[0]) * SATA_PMP_MAX_PORTS,
+		pmp_link = kcalloc(SATA_PMP_MAX_PORTS, sizeof(pmp_link[0]),
 				   GFP_NOIO);
 		if (!pmp_link)
 			return -ENOMEM;
@@ -572,8 +582,11 @@ static void sata_pmp_detach(struct ata_device *dev)
 	if (ap->ops->pmp_detach)
 		ap->ops->pmp_detach(ap);
 
-	ata_for_each_link(tlink, ap, EDGE)
+	ata_for_each_link(tlink, ap, EDGE) {
+		WARN_ON(tlink->deferred_qc);
+		cancel_work_sync(&tlink->deferred_qc_work);
 		ata_eh_detach_dev(tlink->device);
+	}
 
 	spin_lock_irqsave(ap->lock, flags);
 	ap->nr_pmp_links = 0;
@@ -649,11 +662,8 @@ static int sata_pmp_same_pmp(struct ata_device *dev, const u32 *new_gscr)
 static int sata_pmp_revalidate(struct ata_device *dev, unsigned int new_class)
 {
 	struct ata_link *link = dev->link;
-	struct ata_port *ap = link->ap;
-	u32 *gscr = (void *)ap->sector_buf;
+	u32 *gscr = (void *)dev->sector_buf;
 	int rc;
-
-	DPRINTK("ENTER\n");
 
 	ata_eh_about_to_do(link, NULL, ATA_EH_REVALIDATE);
 
@@ -687,12 +697,10 @@ static int sata_pmp_revalidate(struct ata_device *dev, unsigned int new_class)
 
 	ata_eh_done(link, NULL, ATA_EH_REVALIDATE);
 
-	DPRINTK("EXIT, rc=0\n");
 	return 0;
 
  fail:
 	ata_dev_err(dev, "PMP revalidation failed (errno=%d)\n", rc);
-	DPRINTK("EXIT, rc=%d\n", rc);
 	return rc;
 }
 
@@ -760,10 +768,9 @@ static int sata_pmp_eh_recover_pmp(struct ata_port *ap,
 	int detach = 0, rc = 0;
 	int reval_failed = 0;
 
-	DPRINTK("ENTER\n");
-
 	if (dev->flags & ATA_DFLAG_DETACH) {
 		detach = 1;
+		rc = -ENODEV;
 		goto fail;
 	}
 
@@ -828,7 +835,6 @@ static int sata_pmp_eh_recover_pmp(struct ata_port *ap,
 	/* okay, PMP resurrected */
 	ehc->i.flags = 0;
 
-	DPRINTK("EXIT, rc=0\n");
 	return 0;
 
  fail:
@@ -838,7 +844,6 @@ static int sata_pmp_eh_recover_pmp(struct ata_port *ap,
 	else
 		ata_dev_disable(dev);
 
-	DPRINTK("EXIT, rc=%d\n", rc);
 	return rc;
 }
 

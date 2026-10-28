@@ -1,7 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (C) 2015 Thomas Meyer (thomas@m3y3r.de)
  * Copyright (C) 2000 - 2007 Jeff Dike (jdike@{addtoit,linux.intel}.com)
- * Licensed under the GPL
  */
 
 #include <stdio.h>
@@ -16,6 +16,7 @@
 #include <kern_util.h>
 #include <os.h>
 #include <um_malloc.h>
+#include "internal.h"
 
 #define PGD_BOUND (4 * 1024 * 1024)
 #define STACKSIZE (8 * 1024 * 1024)
@@ -37,17 +38,6 @@ static void set_stklim(void)
 			perror("setrlimit");
 			exit(1);
 		}
-	}
-}
-
-static __init void do_uml_initcalls(void)
-{
-	initcall_t *call;
-
-	call = &__uml_initcall_start;
-	while (call < &__uml_initcall_end) {
-		(*call)();
-		call++;
 	}
 }
 
@@ -113,8 +103,6 @@ static void setup_env_path(void)
 	}
 }
 
-extern void scan_elf_aux( char **envp);
-
 int __init main(int argc, char **argv, char **envp)
 {
 	char **new_argv;
@@ -151,7 +139,6 @@ int __init main(int argc, char **argv, char **envp)
 	scan_elf_aux(envp);
 #endif
 
-	do_uml_initcalls();
 	change_sig(SIGPIPE, 0);
 	ret = linux_main(argc, argv);
 
@@ -195,6 +182,11 @@ int __init main(int argc, char **argv, char **envp)
 }
 
 extern void *__real_malloc(int);
+
+/* workaround for -Wmissing-prototypes warnings */
+void *__wrap_malloc(int size);
+void *__wrap_calloc(int n, int size);
+void __wrap_free(void *ptr);
 
 void *__wrap_malloc(int size)
 {

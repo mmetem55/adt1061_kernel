@@ -18,6 +18,7 @@
 #include <linux/kprobes.h>
 #include <linux/nmi.h>
 #include <linux/cpu.h>
+#include <linux/export.h>
 #include <linux/sched/debug.h>
 
 #ifdef arch_trigger_cpumask_backtrace
@@ -34,7 +35,7 @@ static unsigned long backtrace_flag;
  * they are passed being updated as a side effect of this call.
  */
 void nmi_trigger_cpumask_backtrace(const cpumask_t *mask,
-				   bool exclude_self,
+				   int exclude_cpu,
 				   void (*raise)(cpumask_t *mask))
 {
 	int i, this_cpu = get_cpu();
@@ -49,8 +50,8 @@ void nmi_trigger_cpumask_backtrace(const cpumask_t *mask,
 	}
 
 	cpumask_copy(to_cpumask(backtrace_mask), mask);
-	if (exclude_self)
-		cpumask_clear_cpu(this_cpu, to_cpumask(backtrace_mask));
+	if (exclude_cpu != -1)
+		cpumask_clear_cpu(exclude_cpu, to_cpumask(backtrace_mask));
 
 	/*
 	 * Don't try to send an NMI to this cpu; it may work on some
@@ -64,6 +65,7 @@ void nmi_trigger_cpumask_backtrace(const cpumask_t *mask,
 	if (!cpumask_empty(to_cpumask(backtrace_mask))) {
 		pr_info("Sending NMI from CPU %d to CPUs %*pbl:\n",
 			this_cpu, nr_cpumask_bits, to_cpumask(backtrace_mask));
+		nmi_backtrace_stall_snap(to_cpumask(backtrace_mask));
 		raise(to_cpumask(backtrace_mask));
 	}
 
@@ -74,25 +76,36 @@ void nmi_trigger_cpumask_backtrace(const cpumask_t *mask,
 		mdelay(1);
 		touch_softlockup_watchdog();
 	}
+	nmi_backtrace_stall_check(to_cpumask(backtrace_mask));
 
 	/*
 	 * Force flush any remote buffers that might be stuck in IRQ context
 	 * and therefore could not run their irq_work.
 	 */
-	printk_safe_flush();
+	printk_trigger_flush();
 
 	clear_bit_unlock(0, &backtrace_flag);
 	put_cpu();
 }
 
+// Dump stacks even for idle CPUs.
+static bool backtrace_idle;
+module_param(backtrace_idle, bool, 0644);
+
 bool nmi_cpu_backtrace(struct pt_regs *regs)
 {
 	int cpu = smp_processor_id();
+	unsigned long flags;
 
 	if (cpumask_test_cpu(cpu, to_cpumask(backtrace_mask))) {
-		if (regs && cpu_in_idle(instruction_pointer(regs))) {
-			pr_warn("NMI backtrace for cpu %d skipped: idling at pc %#lx\n",
-				cpu, instruction_pointer(regs));
+		/*
+		 * Allow nested NMI backtraces while serializing
+		 * against other CPUs.
+		 */
+		printk_cpu_sync_get_irqsave(flags);
+		if (!READ_ONCE(backtrace_idle) && regs && cpu_in_idle(instruction_pointer(regs))) {
+			pr_warn("NMI backtrace for cpu %d skipped: idling at %pS\n",
+				cpu, (void *)instruction_pointer(regs));
 		} else {
 			pr_warn("NMI backtrace for cpu %d\n", cpu);
 			if (regs)
@@ -100,6 +113,7 @@ bool nmi_cpu_backtrace(struct pt_regs *regs)
 			else
 				dump_stack();
 		}
+		printk_cpu_sync_put_irqrestore(flags);
 		cpumask_clear_cpu(cpu, to_cpumask(backtrace_mask));
 		return true;
 	}
@@ -107,4 +121,10 @@ bool nmi_cpu_backtrace(struct pt_regs *regs)
 	return false;
 }
 NOKPROBE_SYMBOL(nmi_cpu_backtrace);
+
+void cpumask_backtrace(const cpumask_t *mask, int exclude_cpu)
+{
+	arch_trigger_cpumask_backtrace(mask, exclude_cpu);
+}
+EXPORT_SYMBOL_GPL(cpumask_backtrace);
 #endif

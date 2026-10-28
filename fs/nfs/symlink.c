@@ -26,22 +26,14 @@
  * and straight-forward than readdir caching.
  */
 
-static int nfs_symlink_filler(struct file *file, struct page *page)
+static int nfs_symlink_filler(struct file *file, struct folio *folio)
 {
-	struct inode *inode = (struct inode *)file;
+	struct inode *inode = folio->mapping->host;
 	int error;
 
-	error = NFS_PROTO(inode)->readlink(inode, page, 0, PAGE_SIZE);
-	if (error < 0)
-		goto error;
-	SetPageUptodate(page);
-	unlock_page(page);
-	return 0;
-
-error:
-	SetPageError(page);
-	unlock_page(page);
-	return -EIO;
+	error = NFS_PROTO(inode)->readlink(inode, &folio->page, 0, PAGE_SIZE);
+	folio_end_read(folio, error == 0);
+	return error;
 }
 
 static const char *nfs_get_link(struct dentry *dentry,
@@ -66,8 +58,8 @@ static const char *nfs_get_link(struct dentry *dentry,
 		err = ERR_PTR(nfs_revalidate_mapping(inode, inode->i_mapping));
 		if (err)
 			return err;
-		page = read_cache_page(&inode->i_data, 0,
-					nfs_symlink_filler, inode);
+		page = read_cache_page(&inode->i_data, 0, nfs_symlink_filler,
+				NULL);
 		if (IS_ERR(page))
 			return ERR_CAST(page);
 	}

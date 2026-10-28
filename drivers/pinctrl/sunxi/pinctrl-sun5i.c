@@ -12,7 +12,6 @@
 #include <linux/init.h>
 #include <linux/platform_device.h>
 #include <linux/of.h>
-#include <linux/of_device.h>
 #include <linux/pinctrl/pinctrl.h>
 
 #include "pinctrl-sunxi.h"
@@ -713,6 +712,7 @@ static const struct sunxi_pinctrl_desc sun5i_pinctrl_data = {
 	.pins = sun5i_pins,
 	.npins = ARRAY_SIZE(sun5i_pins),
 	.irq_banks = 1,
+	.disable_strict_mode = true,
 };
 
 static int sun5i_pinctrl_probe(struct platform_device *pdev)

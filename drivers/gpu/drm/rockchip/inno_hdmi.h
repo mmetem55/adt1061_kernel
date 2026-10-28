@@ -1,27 +1,14 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (C) Fuzhou Rockchip Electronics Co.Ltd
  *    Zheng Yang <zhengyang@rock-chips.com>
  *    Yakir Yang <ykk@rock-chips.com>
- *
- * This software is licensed under the terms of the GNU General Public
- * License version 2, as published by the Free Software Foundation, and
- * may be copied, distributed, and modified under those terms.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
  */
 
 #ifndef __INNO_HDMI_H__
 #define __INNO_HDMI_H__
 
 #define DDC_SEGMENT_ADDR		0x30
-
-enum PWR_MODE {
-	NORMAL,
-	LOWER_PWR,
-};
 
 #define HDMI_SCL_RATE			(100*1000)
 #define DDC_BUS_FREQ_L			0x4b

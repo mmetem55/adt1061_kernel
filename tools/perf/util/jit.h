@@ -4,8 +4,9 @@
 
 #include <data.h>
 
-int jit_process(struct perf_session *session, struct perf_data_file *output,
-		struct machine *machine, char *filename, pid_t pid, u64 *nbytes);
+int jit_process(struct perf_session *session, struct perf_data *output,
+		struct machine *machine, const char *filename,
+		pid_t pid, pid_t tid, u64 *nbytes);
 
 int jit_inject_record(const char *filename);
 

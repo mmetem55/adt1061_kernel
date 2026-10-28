@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Marvell Armada-3700 SPI controller driver
  *
@@ -5,10 +6,6 @@
  *
  * Author: Wilson Ding <dingwei@marvell.com>
  * Author: Romain Perier <romain.perier@free-electrons.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
  */
 
 #include <linux/clk.h>
@@ -20,13 +17,14 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of.h>
-#include <linux/of_irq.h>
-#include <linux/of_device.h>
+#include <linux/platform_device.h>
 #include <linux/pinctrl/consumer.h>
 #include <linux/spi/spi.h>
 
 #define DRIVER_NAME			"armada_3700_spi"
 
+#define A3700_SPI_MAX_SPEED_HZ		100000000
+#define A3700_SPI_MAX_PRESCALE		30
 #define A3700_SPI_TIMEOUT		10
 
 /* SPI Register Offest */
@@ -101,7 +99,7 @@
 #define A3700_SPI_CLK_CAPT_EDGE		BIT(7)
 
 struct a3700_spi {
-	struct spi_master *master;
+	struct spi_controller *host;
 	void __iomem *base;
 	struct clk *clk;
 	unsigned int irq;
@@ -175,7 +173,7 @@ static int a3700_spi_pin_mode_set(struct a3700_spi *a3700_spi,
 			val |= A3700_SPI_ADDR_PIN;
 		break;
 	default:
-		dev_err(&a3700_spi->master->dev, "wrong pin mode %u", pin_mode);
+		dev_err(&a3700_spi->host->dev, "wrong pin mode %u", pin_mode);
 		return -EINVAL;
 	}
 
@@ -184,12 +182,15 @@ static int a3700_spi_pin_mode_set(struct a3700_spi *a3700_spi,
 	return 0;
 }
 
-static void a3700_spi_fifo_mode_set(struct a3700_spi *a3700_spi)
+static void a3700_spi_fifo_mode_set(struct a3700_spi *a3700_spi, bool enable)
 {
 	u32 val;
 
 	val = spireg_read(a3700_spi, A3700_SPI_IF_CFG_REG);
-	val |= A3700_SPI_FIFO_MODE;
+	if (enable)
+		val |= A3700_SPI_FIFO_MODE;
+	else
+		val &= ~A3700_SPI_FIFO_MODE;
 	spireg_write(a3700_spi, A3700_SPI_IF_CFG_REG, val);
 }
 
@@ -214,7 +215,7 @@ static void a3700_spi_mode_set(struct a3700_spi *a3700_spi,
 }
 
 static void a3700_spi_clock_set(struct a3700_spi *a3700_spi,
-				unsigned int speed_hz, u16 mode)
+				unsigned int speed_hz)
 {
 	u32 val;
 	u32 prescale;
@@ -239,17 +240,6 @@ static void a3700_spi_clock_set(struct a3700_spi *a3700_spi,
 		val |= A3700_SPI_CLK_CAPT_EDGE;
 		spireg_write(a3700_spi, A3700_SPI_IF_TIME_REG, val);
 	}
-
-	val = spireg_read(a3700_spi, A3700_SPI_IF_CFG_REG);
-	val &= ~(A3700_SPI_CLK_POL | A3700_SPI_CLK_PHA);
-
-	if (mode & SPI_CPOL)
-		val |= A3700_SPI_CLK_POL;
-
-	if (mode & SPI_CPHA)
-		val |= A3700_SPI_CLK_PHA;
-
-	spireg_write(a3700_spi, A3700_SPI_IF_CFG_REG, val);
 }
 
 static void a3700_spi_bytelen_set(struct a3700_spi *a3700_spi, unsigned int len)
@@ -285,11 +275,11 @@ static int a3700_spi_fifo_flush(struct a3700_spi *a3700_spi)
 	return -ETIMEDOUT;
 }
 
-static int a3700_spi_init(struct a3700_spi *a3700_spi)
+static void a3700_spi_init(struct a3700_spi *a3700_spi)
 {
-	struct spi_master *master = a3700_spi->master;
+	struct spi_controller *host = a3700_spi->host;
 	u32 val;
-	int i, ret = 0;
+	int i;
 
 	/* Reset SPI unit */
 	val = spireg_read(a3700_spi, A3700_SPI_IF_CFG_REG);
@@ -304,14 +294,14 @@ static int a3700_spi_init(struct a3700_spi *a3700_spi)
 
 	/* Disable AUTO_CS and deactivate all chip-selects */
 	a3700_spi_auto_cs_unset(a3700_spi);
-	for (i = 0; i < master->num_chipselect; i++)
+	for (i = 0; i < host->num_chipselect; i++)
 		a3700_spi_deactivate_cs(a3700_spi, i);
 
 	/* Enable FIFO mode */
-	a3700_spi_fifo_mode_set(a3700_spi);
+	a3700_spi_fifo_mode_set(a3700_spi, true);
 
 	/* Set SPI mode */
-	a3700_spi_mode_set(a3700_spi, master->mode_bits);
+	a3700_spi_mode_set(a3700_spi, host->mode_bits);
 
 	/* Reset counters */
 	spireg_write(a3700_spi, A3700_SPI_IF_HDR_CNT_REG, 0);
@@ -320,17 +310,15 @@ static int a3700_spi_init(struct a3700_spi *a3700_spi)
 	/* Mask the interrupts and clear cause bits */
 	spireg_write(a3700_spi, A3700_SPI_INT_MASK_REG, 0);
 	spireg_write(a3700_spi, A3700_SPI_INT_STAT_REG, ~0U);
-
-	return ret;
 }
 
 static irqreturn_t a3700_spi_interrupt(int irq, void *dev_id)
 {
-	struct spi_master *master = dev_id;
+	struct spi_controller *host = dev_id;
 	struct a3700_spi *a3700_spi;
 	u32 cause;
 
-	a3700_spi = spi_master_get_devdata(master);
+	a3700_spi = spi_controller_get_devdata(host);
 
 	/* Get interrupt causes */
 	cause = spireg_read(a3700_spi, A3700_SPI_INT_STAT_REG);
@@ -351,11 +339,11 @@ static irqreturn_t a3700_spi_interrupt(int irq, void *dev_id)
 static bool a3700_spi_wait_completion(struct spi_device *spi)
 {
 	struct a3700_spi *a3700_spi;
-	unsigned int timeout;
+	unsigned long time_left;
 	unsigned int ctrl_reg;
 	unsigned long timeout_jiffies;
 
-	a3700_spi = spi_master_get_devdata(spi->master);
+	a3700_spi = spi_controller_get_devdata(spi->controller);
 
 	/* SPI interrupt is edge-triggered, which means an interrupt will
 	 * be generated only when detecting a specific status bit changed
@@ -373,12 +361,12 @@ static bool a3700_spi_wait_completion(struct spi_device *spi)
 		     a3700_spi->wait_mask);
 
 	timeout_jiffies = msecs_to_jiffies(A3700_SPI_TIMEOUT);
-	timeout = wait_for_completion_timeout(&a3700_spi->done,
-					      timeout_jiffies);
+	time_left = wait_for_completion_timeout(&a3700_spi->done,
+						timeout_jiffies);
 
 	a3700_spi->wait_mask = 0;
 
-	if (timeout)
+	if (time_left)
 		return true;
 
 	/* there might be the case that right after we checked the
@@ -404,7 +392,7 @@ static bool a3700_spi_transfer_wait(struct spi_device *spi,
 {
 	struct a3700_spi *a3700_spi;
 
-	a3700_spi = spi_master_get_devdata(spi->master);
+	a3700_spi = spi_controller_get_devdata(spi->controller);
 	a3700_spi->wait_mask = bit_mask;
 
 	return a3700_spi_wait_completion(spi);
@@ -427,25 +415,30 @@ static void a3700_spi_transfer_setup(struct spi_device *spi,
 				     struct spi_transfer *xfer)
 {
 	struct a3700_spi *a3700_spi;
-	unsigned int byte_len;
 
-	a3700_spi = spi_master_get_devdata(spi->master);
+	a3700_spi = spi_controller_get_devdata(spi->controller);
 
-	a3700_spi_clock_set(a3700_spi, xfer->speed_hz, spi->mode);
+	a3700_spi_clock_set(a3700_spi, xfer->speed_hz);
 
-	byte_len = xfer->bits_per_word >> 3;
+	/* Use 4 bytes long transfers. Each transfer method has its way to deal
+	 * with the remaining bytes for non 4-bytes aligned transfers.
+	 */
+	a3700_spi_bytelen_set(a3700_spi, 4);
 
-	a3700_spi_fifo_thres_set(a3700_spi, byte_len);
+	/* Initialize the working buffers */
+	a3700_spi->tx_buf  = xfer->tx_buf;
+	a3700_spi->rx_buf  = xfer->rx_buf;
+	a3700_spi->buf_len = xfer->len;
 }
 
 static void a3700_spi_set_cs(struct spi_device *spi, bool enable)
 {
-	struct a3700_spi *a3700_spi = spi_master_get_devdata(spi->master);
+	struct a3700_spi *a3700_spi = spi_controller_get_devdata(spi->controller);
 
 	if (!enable)
-		a3700_spi_activate_cs(a3700_spi, spi->chip_select);
+		a3700_spi_activate_cs(a3700_spi, spi_get_chipselect(spi, 0));
 	else
-		a3700_spi_deactivate_cs(a3700_spi, spi->chip_select);
+		a3700_spi_deactivate_cs(a3700_spi, spi_get_chipselect(spi, 0));
 }
 
 static void a3700_spi_header_set(struct a3700_spi *a3700_spi)
@@ -502,8 +495,8 @@ static int a3700_spi_fifo_write(struct a3700_spi *a3700_spi)
 	u32 val;
 
 	while (!a3700_is_wfifo_full(a3700_spi) && a3700_spi->buf_len) {
-		val = cpu_to_le32(*(u32 *)a3700_spi->tx_buf);
-		spireg_write(a3700_spi, A3700_SPI_DATA_OUT_REG, val);
+		val = *(u32 *)a3700_spi->tx_buf;
+		spireg_write(a3700_spi, A3700_SPI_DATA_OUT_REG, cpu_to_le32(val));
 		a3700_spi->buf_len -= 4;
 		a3700_spi->tx_buf += 4;
 	}
@@ -525,9 +518,8 @@ static int a3700_spi_fifo_read(struct a3700_spi *a3700_spi)
 	while (!a3700_is_rfifo_empty(a3700_spi) && a3700_spi->buf_len) {
 		val = spireg_read(a3700_spi, A3700_SPI_DATA_IN_REG);
 		if (a3700_spi->buf_len >= 4) {
-			u32 data = le32_to_cpu(val);
-
-			memcpy(a3700_spi->rx_buf, &data, 4);
+			val = le32_to_cpu(val);
+			memcpy(a3700_spi->rx_buf, &val, 4);
 
 			a3700_spi->buf_len -= 4;
 			a3700_spi->rx_buf += 4;
@@ -572,10 +564,10 @@ static void a3700_spi_transfer_abort_fifo(struct a3700_spi *a3700_spi)
 	spireg_write(a3700_spi, A3700_SPI_IF_CFG_REG, val);
 }
 
-static int a3700_spi_prepare_message(struct spi_master *master,
+static int a3700_spi_prepare_message(struct spi_controller *host,
 				     struct spi_message *message)
 {
-	struct a3700_spi *a3700_spi = spi_master_get_devdata(master);
+	struct a3700_spi *a3700_spi = spi_controller_get_devdata(host);
 	struct spi_device *spi = message->spi;
 	int ret;
 
@@ -590,25 +582,26 @@ static int a3700_spi_prepare_message(struct spi_master *master,
 	if (ret)
 		return ret;
 
-	a3700_spi_bytelen_set(a3700_spi, 4);
+	a3700_spi_mode_set(a3700_spi, spi->mode);
 
 	return 0;
 }
 
-static int a3700_spi_transfer_one(struct spi_master *master,
+static int a3700_spi_transfer_one_fifo(struct spi_controller *host,
 				  struct spi_device *spi,
 				  struct spi_transfer *xfer)
 {
-	struct a3700_spi *a3700_spi = spi_master_get_devdata(master);
+	struct a3700_spi *a3700_spi = spi_controller_get_devdata(host);
 	int ret = 0, timeout = A3700_SPI_TIMEOUT;
-	unsigned int nbits = 0;
+	unsigned int nbits = 0, byte_len;
 	u32 val;
 
-	a3700_spi_transfer_setup(spi, xfer);
+	/* Make sure we use FIFO mode */
+	a3700_spi_fifo_mode_set(a3700_spi, true);
 
-	a3700_spi->tx_buf  = xfer->tx_buf;
-	a3700_spi->rx_buf  = xfer->rx_buf;
-	a3700_spi->buf_len = xfer->len;
+	/* Configure FIFO thresholds */
+	byte_len = xfer->bits_per_word >> 3;
+	a3700_spi_fifo_thres_set(a3700_spi, byte_len);
 
 	if (xfer->tx_buf)
 		nbits = xfer->tx_nbits;
@@ -738,15 +731,72 @@ static int a3700_spi_transfer_one(struct spi_master *master,
 error:
 	a3700_spi_transfer_abort_fifo(a3700_spi);
 out:
-	spi_finalize_current_transfer(master);
+	spi_finalize_current_transfer(host);
 
 	return ret;
 }
 
-static int a3700_spi_unprepare_message(struct spi_master *master,
+static int a3700_spi_transfer_one_full_duplex(struct spi_controller *host,
+				  struct spi_device *spi,
+				  struct spi_transfer *xfer)
+{
+	struct a3700_spi *a3700_spi = spi_controller_get_devdata(host);
+	u32 val;
+
+	/* Disable FIFO mode */
+	a3700_spi_fifo_mode_set(a3700_spi, false);
+
+	while (a3700_spi->buf_len) {
+
+		/* When we have less than 4 bytes to transfer, switch to 1 byte
+		 * mode. This is reset after each transfer
+		 */
+		if (a3700_spi->buf_len < 4)
+			a3700_spi_bytelen_set(a3700_spi, 1);
+
+		if (a3700_spi->byte_len == 1)
+			val = *a3700_spi->tx_buf;
+		else
+			val = *(u32 *)a3700_spi->tx_buf;
+
+		spireg_write(a3700_spi, A3700_SPI_DATA_OUT_REG, val);
+
+		/* Wait for all the data to be shifted in / out */
+		while (!(spireg_read(a3700_spi, A3700_SPI_IF_CTRL_REG) &
+				A3700_SPI_XFER_DONE))
+			cpu_relax();
+
+		val = spireg_read(a3700_spi, A3700_SPI_DATA_IN_REG);
+
+		memcpy(a3700_spi->rx_buf, &val, a3700_spi->byte_len);
+
+		a3700_spi->buf_len -= a3700_spi->byte_len;
+		a3700_spi->tx_buf += a3700_spi->byte_len;
+		a3700_spi->rx_buf += a3700_spi->byte_len;
+
+	}
+
+	spi_finalize_current_transfer(host);
+
+	return 0;
+}
+
+static int a3700_spi_transfer_one(struct spi_controller *host,
+				  struct spi_device *spi,
+				  struct spi_transfer *xfer)
+{
+	a3700_spi_transfer_setup(spi, xfer);
+
+	if (xfer->tx_buf && xfer->rx_buf)
+		return a3700_spi_transfer_one_full_duplex(host, spi, xfer);
+
+	return a3700_spi_transfer_one_fifo(host, spi, xfer);
+}
+
+static int a3700_spi_unprepare_message(struct spi_controller *host,
 				       struct spi_message *message)
 {
-	struct a3700_spi *a3700_spi = spi_master_get_devdata(master);
+	struct a3700_spi *a3700_spi = spi_controller_get_devdata(host);
 
 	clk_disable(a3700_spi->clk);
 
@@ -764,15 +814,14 @@ static int a3700_spi_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct device_node *of_node = dev->of_node;
-	struct resource *res;
-	struct spi_master *master;
+	struct spi_controller *host;
 	struct a3700_spi *spi;
 	u32 num_cs = 0;
 	int irq, ret = 0;
 
-	master = spi_alloc_master(dev, sizeof(*spi));
-	if (!master) {
-		dev_err(dev, "master allocation failed\n");
+	host = spi_alloc_host(dev, sizeof(*spi));
+	if (!host) {
+		dev_err(dev, "host allocation failed\n");
 		ret = -ENOMEM;
 		goto out;
 	}
@@ -783,28 +832,25 @@ static int a3700_spi_probe(struct platform_device *pdev)
 		goto error;
 	}
 
-	master->bus_num = pdev->id;
-	master->dev.of_node = of_node;
-	master->mode_bits = SPI_MODE_3;
-	master->num_chipselect = num_cs;
-	master->bits_per_word_mask = SPI_BPW_MASK(8) | SPI_BPW_MASK(32);
-	master->prepare_message =  a3700_spi_prepare_message;
-	master->transfer_one = a3700_spi_transfer_one;
-	master->unprepare_message = a3700_spi_unprepare_message;
-	master->set_cs = a3700_spi_set_cs;
-	master->flags = SPI_MASTER_HALF_DUPLEX;
-	master->mode_bits |= (SPI_RX_DUAL | SPI_TX_DUAL |
+	host->bus_num = pdev->id;
+	host->dev.of_node = of_node;
+	host->mode_bits = SPI_MODE_3;
+	host->num_chipselect = num_cs;
+	host->bits_per_word_mask = SPI_BPW_MASK(8) | SPI_BPW_MASK(32);
+	host->prepare_message =  a3700_spi_prepare_message;
+	host->transfer_one = a3700_spi_transfer_one;
+	host->unprepare_message = a3700_spi_unprepare_message;
+	host->set_cs = a3700_spi_set_cs;
+	host->mode_bits |= (SPI_RX_DUAL | SPI_TX_DUAL |
 			      SPI_RX_QUAD | SPI_TX_QUAD);
 
-	platform_set_drvdata(pdev, master);
+	platform_set_drvdata(pdev, host);
 
-	spi = spi_master_get_devdata(master);
-	memset(spi, 0, sizeof(struct a3700_spi));
+	spi = spi_controller_get_devdata(host);
 
-	spi->master = master;
+	spi->host = host;
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	spi->base = devm_ioremap_resource(dev, res);
+	spi->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(spi->base)) {
 		ret = PTR_ERR(spi->base);
 		goto error;
@@ -812,7 +858,6 @@ static int a3700_spi_probe(struct platform_device *pdev)
 
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0) {
-		dev_err(dev, "could not get irq: %d\n", irq);
 		ret = -ENXIO;
 		goto error;
 	}
@@ -820,53 +865,38 @@ static int a3700_spi_probe(struct platform_device *pdev)
 
 	init_completion(&spi->done);
 
-	spi->clk = devm_clk_get(dev, NULL);
+	spi->clk = devm_clk_get_prepared(dev, NULL);
 	if (IS_ERR(spi->clk)) {
 		dev_err(dev, "could not find clk: %ld\n", PTR_ERR(spi->clk));
 		goto error;
 	}
 
-	ret = clk_prepare(spi->clk);
+	host->max_speed_hz = min_t(unsigned long, A3700_SPI_MAX_SPEED_HZ,
+					clk_get_rate(spi->clk));
+	host->min_speed_hz = DIV_ROUND_UP(clk_get_rate(spi->clk),
+						A3700_SPI_MAX_PRESCALE);
+
+	a3700_spi_init(spi);
+
+	ret = devm_request_irq(dev, spi->irq, a3700_spi_interrupt, 0,
+			       dev_name(dev), host);
 	if (ret) {
-		dev_err(dev, "could not prepare clk: %d\n", ret);
+		dev_err(dev, "could not request IRQ: %d\n", ret);
 		goto error;
 	}
 
-	ret = a3700_spi_init(spi);
-	if (ret)
-		goto error_clk;
-
-	ret = devm_request_irq(dev, spi->irq, a3700_spi_interrupt, 0,
-			       dev_name(dev), master);
+	ret = devm_spi_register_controller(dev, host);
 	if (ret) {
-		dev_err(dev, "could not request IRQ: %d\n", ret);
-		goto error_clk;
-	}
-
-	ret = devm_spi_register_master(dev, master);
-	if (ret) {
-		dev_err(dev, "Failed to register master\n");
-		goto error_clk;
+		dev_err(dev, "Failed to register host\n");
+		goto error;
 	}
 
 	return 0;
 
-error_clk:
-	clk_disable_unprepare(spi->clk);
 error:
-	spi_master_put(master);
+	spi_controller_put(host);
 out:
 	return ret;
-}
-
-static int a3700_spi_remove(struct platform_device *pdev)
-{
-	struct spi_master *master = platform_get_drvdata(pdev);
-	struct a3700_spi *spi = spi_master_get_devdata(master);
-
-	clk_unprepare(spi->clk);
-
-	return 0;
 }
 
 static struct platform_driver a3700_spi_driver = {
@@ -875,7 +905,6 @@ static struct platform_driver a3700_spi_driver = {
 		.of_match_table = of_match_ptr(a3700_spi_dt_ids),
 	},
 	.probe		= a3700_spi_probe,
-	.remove		= a3700_spi_remove,
 };
 
 module_platform_driver(a3700_spi_driver);

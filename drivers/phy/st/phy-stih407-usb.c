@@ -1,14 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (C) 2014 STMicroelectronics
  *
  * STMicroelectronics Generic PHY driver for STiH407 USB2.
  *
  * Author: Giuseppe Cavallaro <peppe.cavallaro@st.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2, as
- * published by the Free Software Foundation.
- *
  */
 #include <linux/platform_device.h>
 #include <linux/io.h>
@@ -152,8 +148,6 @@ static int stih407_usb2_picophy_probe(struct platform_device *pdev)
 	phy_provider = devm_of_phy_provider_register(dev, of_phy_simple_xlate);
 	if (IS_ERR(phy_provider))
 		return PTR_ERR(phy_provider);
-
-	dev_info(dev, "STiH407 USB Generic picoPHY driver probed!");
 
 	return 0;
 }

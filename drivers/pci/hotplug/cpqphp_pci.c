@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0+
 /*
  * Compaq Hot Plug Controller Driver
  *
@@ -6,21 +7,6 @@
  * Copyright (C) 2001 IBM Corp.
  *
  * All rights reserved.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or (at
- * your option) any later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE, GOOD TITLE or
- * NON INFRINGEMENT.  See the GNU General Public License for more
- * details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  *
  * Send feedback to <greg@kroah.com>
  *
@@ -89,7 +75,9 @@ int cpqhp_configure_device(struct controller *ctrl, struct pci_func *func)
 	pci_lock_rescan_remove();
 
 	if (func->pci_dev == NULL)
-		func->pci_dev = pci_get_bus_and_slot(func->bus, PCI_DEVFN(func->device, func->function));
+		func->pci_dev = pci_get_domain_bus_and_slot(0, func->bus,
+							PCI_DEVFN(func->device,
+							func->function));
 
 	/* No pci device, we need to create it then */
 	if (func->pci_dev == NULL) {
@@ -99,7 +87,9 @@ int cpqhp_configure_device(struct controller *ctrl, struct pci_func *func)
 		if (num)
 			pci_bus_add_devices(ctrl->pci_dev->bus);
 
-		func->pci_dev = pci_get_bus_and_slot(func->bus, PCI_DEVFN(func->device, func->function));
+		func->pci_dev = pci_get_domain_bus_and_slot(0, func->bus,
+							PCI_DEVFN(func->device,
+							func->function));
 		if (func->pci_dev == NULL) {
 			dbg("ERROR: pci_dev still null\n");
 			goto out;
@@ -129,7 +119,10 @@ int cpqhp_unconfigure_device(struct pci_func *func)
 
 	pci_lock_rescan_remove();
 	for (j = 0; j < 8 ; j++) {
-		struct pci_dev *temp = pci_get_bus_and_slot(func->bus, PCI_DEVFN(func->device, j));
+		struct pci_dev *temp = pci_get_domain_bus_and_slot(0,
+							func->bus,
+							PCI_DEVFN(func->device,
+							j));
 		if (temp) {
 			pci_dev_put(temp);
 			pci_stop_and_remove_bus_device(temp);
@@ -142,11 +135,13 @@ int cpqhp_unconfigure_device(struct pci_func *func)
 static int PCI_RefinedAccessConfig(struct pci_bus *bus, unsigned int devfn, u8 offset, u32 *value)
 {
 	u32 vendID = 0;
+	int ret;
 
-	if (pci_bus_read_config_dword(bus, devfn, PCI_VENDOR_ID, &vendID) == -1)
-		return -1;
-	if (vendID == 0xffffffff)
-		return -1;
+	ret = pci_bus_read_config_dword(bus, devfn, PCI_VENDOR_ID, &vendID);
+	if (ret != PCIBIOS_SUCCESSFUL)
+		return PCIBIOS_DEVICE_NOT_FOUND;
+	if (PCI_POSSIBLE_ERROR(vendID))
+		return PCIBIOS_DEVICE_NOT_FOUND;
 	return pci_bus_read_config_dword(bus, devfn, offset, value);
 }
 
@@ -196,8 +191,10 @@ int cpqhp_set_irq(u8 bus_num, u8 dev_num, u8 int_pin, u8 irq_num)
 		/* This should only be for x86 as it sets the Edge Level
 		 * Control Register
 		 */
-		outb((u8) (temp_word & 0xFF), 0x4d0); outb((u8) ((temp_word &
-		0xFF00) >> 8), 0x4d1); rc = 0; }
+		outb((u8)(temp_word & 0xFF), 0x4d0);
+		outb((u8)((temp_word & 0xFF00) >> 8), 0x4d1);
+		rc = 0;
+	}
 
 	return rc;
 }
@@ -207,13 +204,15 @@ static int PCI_ScanBusForNonBridge(struct controller *ctrl, u8 bus_num, u8 *dev_
 {
 	u16 tdevice;
 	u32 work;
+	int ret;
 	u8 tbus;
 
 	ctrl->pci_bus->number = bus_num;
 
 	for (tdevice = 0; tdevice < 0xFF; tdevice++) {
 		/* Scan for access first */
-		if (PCI_RefinedAccessConfig(ctrl->pci_bus, tdevice, 0x08, &work) == -1)
+		ret = PCI_RefinedAccessConfig(ctrl->pci_bus, tdevice, 0x08, &work);
+		if (ret)
 			continue;
 		dbg("Looking for nonbridge bus_num %d dev_num %d\n", bus_num, tdevice);
 		/* Yep we got one. Not a bridge ? */
@@ -225,7 +224,8 @@ static int PCI_ScanBusForNonBridge(struct controller *ctrl, u8 bus_num, u8 *dev_
 	}
 	for (tdevice = 0; tdevice < 0xFF; tdevice++) {
 		/* Scan for access first */
-		if (PCI_RefinedAccessConfig(ctrl->pci_bus, tdevice, 0x08, &work) == -1)
+		ret = PCI_RefinedAccessConfig(ctrl->pci_bus, tdevice, 0x08, &work);
+		if (ret)
 			continue;
 		dbg("Looking for bridge bus_num %d dev_num %d\n", bus_num, tdevice);
 		/* Yep we got one. bridge ? */
@@ -258,7 +258,7 @@ static int PCI_GetBusDevHelper(struct controller *ctrl, u8 *bus_num, u8 *dev_num
 			*dev_num = tdevice;
 			ctrl->pci_bus->number = tbus;
 			pci_bus_read_config_dword(ctrl->pci_bus, *dev_num, PCI_VENDOR_ID, &work);
-			if (!nobridge || (work == 0xffffffff))
+			if (!nobridge || PCI_POSSIBLE_ERROR(work))
 				return 0;
 
 			dbg("bus_num %d devfn %d\n", *bus_num, *dev_num);
@@ -319,6 +319,7 @@ int cpqhp_save_config(struct controller *ctrl, int busnumber, int is_hot_plug)
 	int cloop = 0;
 	int stop_it;
 	int index;
+	u16 devfn;
 
 	/* Decide which slots are supported */
 
@@ -367,7 +368,7 @@ int cpqhp_save_config(struct controller *ctrl, int busnumber, int is_hot_plug)
 			return rc;
 
 		/* If multi-function device, set max_functions to 8 */
-		if (header_type & 0x80)
+		if (header_type & PCI_HEADER_TYPE_MFD)
 			max_functions = 8;
 		else
 			max_functions = 1;
@@ -376,7 +377,7 @@ int cpqhp_save_config(struct controller *ctrl, int busnumber, int is_hot_plug)
 
 		do {
 			DevError = 0;
-			if ((header_type & 0x7F) == PCI_HEADER_TYPE_BRIDGE) {
+			if ((header_type & PCI_HEADER_TYPE_MASK) == PCI_HEADER_TYPE_BRIDGE) {
 				/* Recurse the subordinate bus
 				 * get the subordinate bus number
 				 */
@@ -416,7 +417,9 @@ int cpqhp_save_config(struct controller *ctrl, int busnumber, int is_hot_plug)
 			new_slot->switch_save = 0x10;
 			/* In case of unsupported board */
 			new_slot->status = DevError;
-			new_slot->pci_dev = pci_get_bus_and_slot(new_slot->bus, (new_slot->device << 3) | new_slot->function);
+			devfn = (new_slot->device << 3) | new_slot->function;
+			new_slot->pci_dev = pci_get_domain_bus_and_slot(0,
+							new_slot->bus, devfn);
 
 			for (cloop = 0; cloop < 0x20; cloop++) {
 				rc = pci_bus_read_config_dword(ctrl->pci_bus, PCI_DEVFN(device, function), cloop << 2, (u32 *) &(new_slot->config_space[cloop]));
@@ -475,7 +478,7 @@ int cpqhp_save_slot_config(struct controller *ctrl, struct pci_func *new_slot)
 	int sub_bus;
 	int max_functions;
 	int function = 0;
-	int cloop = 0;
+	int cloop;
 	int stop_it;
 
 	ID = 0xFFFFFFFF;
@@ -489,13 +492,13 @@ int cpqhp_save_slot_config(struct controller *ctrl, struct pci_func *new_slot)
 	pci_bus_read_config_byte(ctrl->pci_bus, PCI_DEVFN(new_slot->device, 0), 0x0B, &class_code);
 	pci_bus_read_config_byte(ctrl->pci_bus, PCI_DEVFN(new_slot->device, 0), PCI_HEADER_TYPE, &header_type);
 
-	if (header_type & 0x80)	/* Multi-function device */
+	if (header_type & PCI_HEADER_TYPE_MFD)
 		max_functions = 8;
 	else
 		max_functions = 1;
 
 	while (function < max_functions) {
-		if ((header_type & 0x7F) == PCI_HEADER_TYPE_BRIDGE) {
+		if ((header_type & PCI_HEADER_TYPE_MASK) == PCI_HEADER_TYPE_BRIDGE) {
 			/*  Recurse the subordinate bus */
 			pci_bus_read_config_byte(ctrl->pci_bus, PCI_DEVFN(new_slot->device, function), PCI_SECONDARY_BUS, &secondary_bus);
 
@@ -573,7 +576,7 @@ int cpqhp_save_base_addr_length(struct controller *ctrl, struct pci_func *func)
 		/* Check for Bridge */
 		pci_bus_read_config_byte(pci_bus, devfn, PCI_HEADER_TYPE, &header_type);
 
-		if ((header_type & 0x7F) == PCI_HEADER_TYPE_BRIDGE) {
+		if ((header_type & PCI_HEADER_TYPE_MASK) == PCI_HEADER_TYPE_BRIDGE) {
 			pci_bus_read_config_byte(pci_bus, devfn, PCI_SECONDARY_BUS, &secondary_bus);
 
 			sub_bus = (int) secondary_bus;
@@ -627,7 +630,7 @@ int cpqhp_save_base_addr_length(struct controller *ctrl, struct pci_func *func)
 
 			}	/* End of base register loop */
 
-		} else if ((header_type & 0x7F) == 0x00) {
+		} else if ((header_type & PCI_HEADER_TYPE_MASK) == PCI_HEADER_TYPE_NORMAL) {
 			/* Figure out IO and memory base lengths */
 			for (cloop = 0x10; cloop <= 0x24; cloop += 4) {
 				temp_register = 0xFFFFFFFF;
@@ -725,7 +728,7 @@ int cpqhp_save_used_resources(struct controller *ctrl, struct pci_func *func)
 		/* Check for Bridge */
 		pci_bus_read_config_byte(pci_bus, devfn, PCI_HEADER_TYPE, &header_type);
 
-		if ((header_type & 0x7F) == PCI_HEADER_TYPE_BRIDGE) {
+		if ((header_type & PCI_HEADER_TYPE_MASK) == PCI_HEADER_TYPE_BRIDGE) {
 			/* Clear Bridge Control Register */
 			command = 0x00;
 			pci_bus_write_config_word(pci_bus, devfn, PCI_BRIDGE_CONTROL, command);
@@ -860,7 +863,7 @@ int cpqhp_save_used_resources(struct controller *ctrl, struct pci_func *func)
 				}
 			}	/* End of base register loop */
 		/* Standard header */
-		} else if ((header_type & 0x7F) == 0x00) {
+		} else if ((header_type & PCI_HEADER_TYPE_MASK) == PCI_HEADER_TYPE_NORMAL) {
 			/* Figure out IO and memory base lengths */
 			for (cloop = 0x10; cloop <= 0x24; cloop += 4) {
 				pci_bus_read_config_dword(pci_bus, devfn, cloop, &save_base);
@@ -977,7 +980,7 @@ int cpqhp_configure_board(struct controller *ctrl, struct pci_func *func)
 		pci_bus_read_config_byte(pci_bus, devfn, PCI_HEADER_TYPE, &header_type);
 
 		/* If this is a bridge device, restore subordinate devices */
-		if ((header_type & 0x7F) == PCI_HEADER_TYPE_BRIDGE) {
+		if ((header_type & PCI_HEADER_TYPE_MASK) == PCI_HEADER_TYPE_BRIDGE) {
 			pci_bus_read_config_byte(pci_bus, devfn, PCI_SECONDARY_BUS, &secondary_bus);
 
 			sub_bus = (int) secondary_bus;
@@ -1069,7 +1072,7 @@ int cpqhp_valid_replace(struct controller *ctrl, struct pci_func *func)
 		/* Check for Bridge */
 		pci_bus_read_config_byte(pci_bus, devfn, PCI_HEADER_TYPE, &header_type);
 
-		if ((header_type & 0x7F) == PCI_HEADER_TYPE_BRIDGE) {
+		if ((header_type & PCI_HEADER_TYPE_MASK) == PCI_HEADER_TYPE_BRIDGE) {
 			/* In order to continue checking, we must program the
 			 * bus registers in the bridge to respond to accesses
 			 * for its subordinate bus(es)
@@ -1092,7 +1095,7 @@ int cpqhp_valid_replace(struct controller *ctrl, struct pci_func *func)
 
 		}
 		/* Check to see if it is a standard config header */
-		else if ((header_type & 0x7F) == PCI_HEADER_TYPE_NORMAL) {
+		else if ((header_type & PCI_HEADER_TYPE_MASK) == PCI_HEADER_TYPE_NORMAL) {
 			/* Check subsystem vendor and ID */
 			pci_bus_read_config_dword(pci_bus, devfn, PCI_SUBSYSTEM_VENDOR_ID, &temp_register);
 

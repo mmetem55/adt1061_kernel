@@ -1,14 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0+
 /*
  * Safe Encapsulated USB Serial Driver
  *
  *      Copyright (C) 2010 Johan Hovold <jhovold@gmail.com>
  *      Copyright (C) 2001 Lineo
  *      Copyright (C) 2001 Hewlett-Packard
- *
- *	This program is free software; you can redistribute it and/or modify
- *	it under the terms of the GNU General Public License as published by
- *	the Free Software Foundation; either version 2 of the License, or
- *	(at your option) any later version.
  *
  * By:
  *      Stuart Lynne <sl@lineo.com>, Tom Rushworth <tbr@lineo.com>
@@ -263,6 +259,7 @@ static int safe_prepare_write_buffer(struct usb_serial_port *port,
 static int safe_startup(struct usb_serial *serial)
 {
 	struct usb_interface_descriptor	*desc;
+	int bulk_out_size;
 
 	if (serial->dev->descriptor.bDeviceClass != CDC_DEVICE_CLASS)
 		return -ENODEV;
@@ -283,12 +280,21 @@ static int safe_startup(struct usb_serial *serial)
 	default:
 		return -EINVAL;
 	}
+
+	/*
+	 * The bulk-out buffer needs to be large enough for the two-byte
+	 * trailer in safe mode, but assume anything smaller than eight bytes
+	 * is broken.
+	 */
+	bulk_out_size = serial->port[0]->bulk_out_size;
+	if (bulk_out_size > 0 && bulk_out_size < 8)
+		return -EINVAL;
+
 	return 0;
 }
 
 static struct usb_serial_driver safe_device = {
 	.driver = {
-		.owner =	THIS_MODULE,
 		.name =		"safe_serial",
 	},
 	.id_table =		id_table,

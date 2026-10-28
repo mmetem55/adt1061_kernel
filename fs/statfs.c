@@ -29,17 +29,19 @@ static int flags_by_mnt(int mnt_flags)
 		flags |= ST_NODIRATIME;
 	if (mnt_flags & MNT_RELATIME)
 		flags |= ST_RELATIME;
+	if (mnt_flags & MNT_NOSYMFOLLOW)
+		flags |= ST_NOSYMFOLLOW;
 	return flags;
 }
 
 static int flags_by_sb(int s_flags)
 {
 	int flags = 0;
-	if (s_flags & MS_SYNCHRONOUS)
+	if (s_flags & SB_SYNCHRONOUS)
 		flags |= ST_SYNCHRONOUS;
-	if (s_flags & MS_MANDLOCK)
+	if (s_flags & SB_MANDLOCK)
 		flags |= ST_MANDLOCK;
-	if (s_flags & MS_RDONLY)
+	if (s_flags & SB_RDONLY)
 		flags |= ST_RDONLY;
 	return flags;
 }
@@ -67,6 +69,20 @@ static int statfs_by_dentry(struct dentry *dentry, struct kstatfs *buf)
 	return retval;
 }
 
+int vfs_get_fsid(struct dentry *dentry, __kernel_fsid_t *fsid)
+{
+	struct kstatfs st;
+	int error;
+
+	error = statfs_by_dentry(dentry, &st);
+	if (error)
+		return error;
+
+	*fsid = st.f_fsid;
+	return 0;
+}
+EXPORT_SYMBOL(vfs_get_fsid);
+
 int vfs_statfs(const struct path *path, struct kstatfs *buf)
 {
 	int error;
@@ -76,7 +92,7 @@ int vfs_statfs(const struct path *path, struct kstatfs *buf)
 		buf->f_flags = calculate_f_flags(path->mnt);
 	return error;
 }
-EXPORT_SYMBOL(vfs_statfs);
+EXPORT_SYMBOL_NS(vfs_statfs, ANDROID_GKI_VFS_EXPORT_ONLY);
 
 int user_statfs(const char __user *pathname, struct kstatfs *st)
 {
@@ -100,8 +116,8 @@ int fd_statfs(int fd, struct kstatfs *st)
 {
 	struct fd f = fdget_raw(fd);
 	int error = -EBADF;
-	if (f.file) {
-		error = vfs_statfs(&f.file->f_path, st);
+	if (fd_file(f)) {
+		error = vfs_statfs(&fd_file(f)->f_path, st);
 		fdput(f);
 	}
 	return error;
@@ -114,6 +130,7 @@ static int do_statfs_native(struct kstatfs *st, struct statfs __user *p)
 	if (sizeof(buf) == sizeof(*st))
 		memcpy(&buf, st, sizeof(*st));
 	else {
+		memset(&buf, 0, sizeof(buf));
 		if (sizeof buf.f_blocks == 4) {
 			if ((st->f_blocks | st->f_bfree | st->f_bavail |
 			     st->f_bsize | st->f_frsize) &
@@ -142,7 +159,6 @@ static int do_statfs_native(struct kstatfs *st, struct statfs __user *p)
 		buf.f_namelen = st->f_namelen;
 		buf.f_frsize = st->f_frsize;
 		buf.f_flags = st->f_flags;
-		memset(buf.f_spare, 0, sizeof(buf.f_spare));
 	}
 	if (copy_to_user(p, &buf, sizeof(buf)))
 		return -EFAULT;
@@ -155,6 +171,7 @@ static int do_statfs64(struct kstatfs *st, struct statfs64 __user *p)
 	if (sizeof(buf) == sizeof(*st))
 		memcpy(&buf, st, sizeof(*st));
 	else {
+		memset(&buf, 0, sizeof(buf));
 		buf.f_type = st->f_type;
 		buf.f_bsize = st->f_bsize;
 		buf.f_blocks = st->f_blocks;
@@ -166,7 +183,6 @@ static int do_statfs64(struct kstatfs *st, struct statfs64 __user *p)
 		buf.f_namelen = st->f_namelen;
 		buf.f_frsize = st->f_frsize;
 		buf.f_flags = st->f_flags;
-		memset(buf.f_spare, 0, sizeof(buf.f_spare));
 	}
 	if (copy_to_user(p, &buf, sizeof(buf)))
 		return -EFAULT;
@@ -217,9 +233,9 @@ SYSCALL_DEFINE3(fstatfs64, unsigned int, fd, size_t, sz, struct statfs64 __user 
 	return error;
 }
 
-int vfs_ustat(dev_t dev, struct kstatfs *sbuf)
+static int vfs_ustat(dev_t dev, struct kstatfs *sbuf)
 {
-	struct super_block *s = user_get_super(dev);
+	struct super_block *s = user_get_super(dev, false);
 	int err;
 	if (!s)
 		return -EINVAL;
@@ -239,7 +255,10 @@ SYSCALL_DEFINE2(ustat, unsigned, dev, struct ustat __user *, ubuf)
 
 	memset(&tmp,0,sizeof(struct ustat));
 	tmp.f_tfree = sbuf.f_bfree;
-	tmp.f_tinode = sbuf.f_ffree;
+	if (IS_ENABLED(CONFIG_ARCH_32BIT_USTAT_F_TINODE))
+		tmp.f_tinode = min_t(u64, sbuf.f_ffree, UINT_MAX);
+	else
+		tmp.f_tinode = sbuf.f_ffree;
 
 	return copy_to_user(ubuf, &tmp, sizeof(struct ustat)) ? -EFAULT : 0;
 }
@@ -304,19 +323,10 @@ COMPAT_SYSCALL_DEFINE2(fstatfs, unsigned int, fd, struct compat_statfs __user *,
 static int put_compat_statfs64(struct compat_statfs64 __user *ubuf, struct kstatfs *kbuf)
 {
 	struct compat_statfs64 buf;
-	if (sizeof(ubuf->f_bsize) == 4) {
-		if ((kbuf->f_type | kbuf->f_bsize | kbuf->f_namelen |
-		     kbuf->f_frsize | kbuf->f_flags) & 0xffffffff00000000ULL)
-			return -EOVERFLOW;
-		/* f_files and f_ffree may be -1; it's okay
-		 * to stuff that into 32 bits */
-		if (kbuf->f_files != 0xffffffffffffffffULL
-		 && (kbuf->f_files & 0xffffffff00000000ULL))
-			return -EOVERFLOW;
-		if (kbuf->f_ffree != 0xffffffffffffffffULL
-		 && (kbuf->f_ffree & 0xffffffff00000000ULL))
-			return -EOVERFLOW;
-	}
+
+	if ((kbuf->f_bsize | kbuf->f_frsize) & 0xffffffff00000000ULL)
+		return -EOVERFLOW;
+
 	memset(&buf, 0, sizeof(struct compat_statfs64));
 	buf.f_type = kbuf->f_type;
 	buf.f_bsize = kbuf->f_bsize;
@@ -335,7 +345,7 @@ static int put_compat_statfs64(struct compat_statfs64 __user *ubuf, struct kstat
 	return 0;
 }
 
-COMPAT_SYSCALL_DEFINE3(statfs64, const char __user *, pathname, compat_size_t, sz, struct compat_statfs64 __user *, buf)
+int kcompat_sys_statfs64(const char __user * pathname, compat_size_t sz, struct compat_statfs64 __user * buf)
 {
 	struct kstatfs tmp;
 	int error;
@@ -349,7 +359,12 @@ COMPAT_SYSCALL_DEFINE3(statfs64, const char __user *, pathname, compat_size_t, s
 	return error;
 }
 
-COMPAT_SYSCALL_DEFINE3(fstatfs64, unsigned int, fd, compat_size_t, sz, struct compat_statfs64 __user *, buf)
+COMPAT_SYSCALL_DEFINE3(statfs64, const char __user *, pathname, compat_size_t, sz, struct compat_statfs64 __user *, buf)
+{
+	return kcompat_sys_statfs64(pathname, sz, buf);
+}
+
+int kcompat_sys_fstatfs64(unsigned int fd, compat_size_t sz, struct compat_statfs64 __user * buf)
 {
 	struct kstatfs tmp;
 	int error;
@@ -361,6 +376,11 @@ COMPAT_SYSCALL_DEFINE3(fstatfs64, unsigned int, fd, compat_size_t, sz, struct co
 	if (!error)
 		error = put_compat_statfs64(buf, &tmp);
 	return error;
+}
+
+COMPAT_SYSCALL_DEFINE3(fstatfs64, unsigned int, fd, compat_size_t, sz, struct compat_statfs64 __user *, buf)
+{
+	return kcompat_sys_fstatfs64(fd, sz, buf);
 }
 
 /*

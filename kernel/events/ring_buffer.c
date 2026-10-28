@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Performance events ring-buffer code:
  *
@@ -5,10 +6,9 @@
  *  Copyright (C) 2008-2011 Red Hat, Inc., Ingo Molnar
  *  Copyright (C) 2008-2011 Red Hat, Inc., Peter Zijlstra
  *  Copyright  ©  2009 Paul Mackerras, IBM Corp. <paulus@au1.ibm.com>
- *
- * For licensing details see kernel-base/COPYING
  */
 
+#include <linux/page_size_compat_defs.h>
 #include <linux/perf_event.h>
 #include <linux/vmalloc.h>
 #include <linux/slab.h>
@@ -20,10 +20,14 @@
 
 static void perf_output_wakeup(struct perf_output_handle *handle)
 {
-	atomic_set(&handle->rb->poll, POLLIN);
+	atomic_set(&handle->rb->poll, EPOLLIN | EPOLLRDNORM);
 
 	handle->event->pending_wakeup = 1;
-	irq_work_queue(&handle->event->pending);
+
+	if (*perf_event_fasync(handle->event) && !handle->event->pending_kill)
+		handle->event->pending_kill = POLL_IN;
+
+	irq_work_queue(&handle->event->pending_irq);
 }
 
 /*
@@ -36,17 +40,33 @@ static void perf_output_wakeup(struct perf_output_handle *handle)
  */
 static void perf_output_get_handle(struct perf_output_handle *handle)
 {
-	struct ring_buffer *rb = handle->rb;
+	struct perf_buffer *rb = handle->rb;
 
 	preempt_disable();
-	local_inc(&rb->nest);
+
+	/*
+	 * Avoid an explicit LOAD/STORE such that architectures with memops
+	 * can use them.
+	 */
+	(*(volatile unsigned int *)&rb->nest)++;
 	handle->wakeup = local_read(&rb->wakeup);
 }
 
 static void perf_output_put_handle(struct perf_output_handle *handle)
 {
-	struct ring_buffer *rb = handle->rb;
+	struct perf_buffer *rb = handle->rb;
 	unsigned long head;
+	unsigned int nest;
+
+	/*
+	 * If this isn't the outermost nesting, we don't have to update
+	 * @rb->user_page->data_head.
+	 */
+	nest = READ_ONCE(rb->nest);
+	if (nest > 1) {
+		WRITE_ONCE(rb->nest, nest - 1);
+		goto out;
+	}
 
 again:
 	/*
@@ -64,15 +84,6 @@ again:
 	 * IRQ/NMI can happen here and advance @rb->head, causing our
 	 * load above to be stale.
 	 */
-
-	/*
-	 * If this isn't the outermost nesting, we don't have to update
-	 * @rb->user_page->data_head.
-	 */
-	if (local_read(&rb->nest) > 1) {
-		local_dec(&rb->nest);
-		goto out;
-	}
 
 	/*
 	 * Since the mmap() consumer (userspace) can run on a different CPU:
@@ -109,7 +120,7 @@ again:
 	 * write will (temporarily) publish a stale value.
 	 */
 	barrier();
-	local_set(&rb->nest, 0);
+	WRITE_ONCE(rb->nest, 0);
 
 	/*
 	 * Ensure we decrement @rb->nest before we validate the @rb->head.
@@ -117,7 +128,7 @@ again:
 	 */
 	barrier();
 	if (unlikely(head != local_read(&rb->head))) {
-		local_inc(&rb->nest);
+		WRITE_ONCE(rb->nest, 1);
 		goto again;
 	}
 
@@ -128,7 +139,7 @@ out:
 	preempt_enable();
 }
 
-static bool __always_inline
+static __always_inline bool
 ring_buffer_has_space(unsigned long head, unsigned long tail,
 		      unsigned long data_size, unsigned int size,
 		      bool backward)
@@ -139,12 +150,13 @@ ring_buffer_has_space(unsigned long head, unsigned long tail,
 		return CIRC_SPACE(tail, head, data_size) >= size;
 }
 
-static int __always_inline
+static __always_inline int
 __perf_output_begin(struct perf_output_handle *handle,
+		    struct perf_sample_data *data,
 		    struct perf_event *event, unsigned int size,
 		    bool backward)
 {
-	struct ring_buffer *rb;
+	struct perf_buffer *rb;
 	unsigned long tail, offset, head;
 	int have_lost, page_shift;
 	struct {
@@ -165,13 +177,16 @@ __perf_output_begin(struct perf_output_handle *handle,
 		goto out;
 
 	if (unlikely(rb->paused)) {
-		if (rb->nr_pages)
+		if (rb->nr_pages) {
 			local_inc(&rb->lost);
+			atomic64_inc(&event->lost_samples);
+		}
 		goto out;
 	}
 
 	handle->rb    = rb;
 	handle->event = event;
+	handle->flags = 0;
 
 	have_lost = local_read(&rb->lost);
 	if (unlikely(have_lost)) {
@@ -182,9 +197,10 @@ __perf_output_begin(struct perf_output_handle *handle,
 
 	perf_output_get_handle(handle);
 
+	offset = local_read(&rb->head);
 	do {
+		head = offset;
 		tail = READ_ONCE(rb->user_page->data_tail);
-		offset = head = local_read(&rb->head);
 		if (!rb->overwrite) {
 			if (unlikely(!ring_buffer_has_space(head, tail,
 							    perf_data_size(rb),
@@ -208,7 +224,7 @@ __perf_output_begin(struct perf_output_handle *handle,
 			head += size;
 		else
 			head -= size;
-	} while (local_cmpxchg(&rb->head, offset, head) != offset);
+	} while (!local_try_cmpxchg(&rb->head, &offset, head));
 
 	if (backward) {
 		offset = head;
@@ -231,24 +247,23 @@ __perf_output_begin(struct perf_output_handle *handle,
 	handle->size = (1UL << page_shift) - offset;
 
 	if (unlikely(have_lost)) {
-		struct perf_sample_data sample_data;
-
 		lost_event.header.size = sizeof(lost_event);
 		lost_event.header.type = PERF_RECORD_LOST;
 		lost_event.header.misc = 0;
 		lost_event.id          = event->id;
 		lost_event.lost        = local_xchg(&rb->lost, 0);
 
-		perf_event_header__init_id(&lost_event.header,
-					   &sample_data, event);
+		/* XXX mostly redundant; @data is already fully initializes */
+		perf_event_header__init_id(&lost_event.header, data, event);
 		perf_output_put(handle, lost_event);
-		perf_event__output_id_sample(event, handle, &sample_data);
+		perf_event__output_id_sample(event, handle, data);
 	}
 
 	return 0;
 
 fail:
 	local_inc(&rb->lost);
+	atomic64_inc(&event->lost_samples);
 	perf_output_put_handle(handle);
 out:
 	rcu_read_unlock();
@@ -257,22 +272,25 @@ out:
 }
 
 int perf_output_begin_forward(struct perf_output_handle *handle,
-			     struct perf_event *event, unsigned int size)
+			      struct perf_sample_data *data,
+			      struct perf_event *event, unsigned int size)
 {
-	return __perf_output_begin(handle, event, size, false);
+	return __perf_output_begin(handle, data, event, size, false);
 }
 
 int perf_output_begin_backward(struct perf_output_handle *handle,
+			       struct perf_sample_data *data,
 			       struct perf_event *event, unsigned int size)
 {
-	return __perf_output_begin(handle, event, size, true);
+	return __perf_output_begin(handle, data, event, size, true);
 }
 
 int perf_output_begin(struct perf_output_handle *handle,
+		      struct perf_sample_data *data,
 		      struct perf_event *event, unsigned int size)
 {
 
-	return __perf_output_begin(handle, event, size,
+	return __perf_output_begin(handle, data, event, size,
 				   unlikely(is_write_backward(event)));
 }
 
@@ -295,7 +313,7 @@ void perf_output_end(struct perf_output_handle *handle)
 }
 
 static void
-ring_buffer_init(struct ring_buffer *rb, long watermark, int flags)
+ring_buffer_init(struct perf_buffer *rb, long watermark, int flags)
 {
 	long max_size = perf_data_size(rb);
 
@@ -310,7 +328,7 @@ ring_buffer_init(struct ring_buffer *rb, long watermark, int flags)
 	else
 		rb->overwrite = 1;
 
-	atomic_set(&rb->refcount, 1);
+	refcount_set(&rb->refcount, 1);
 
 	INIT_LIST_HEAD(&rb->event_list);
 	spin_lock_init(&rb->event_lock);
@@ -321,6 +339,8 @@ ring_buffer_init(struct ring_buffer *rb, long watermark, int flags)
 	 */
 	if (!rb->nr_pages)
 		rb->paused = 1;
+
+	mutex_init(&rb->aux_mutex);
 }
 
 void perf_aux_output_flag(struct perf_output_handle *handle, u64 flags)
@@ -355,7 +375,8 @@ void *perf_aux_output_begin(struct perf_output_handle *handle,
 {
 	struct perf_event *output_event = event;
 	unsigned long aux_head, aux_tail;
-	struct ring_buffer *rb;
+	struct perf_buffer *rb;
+	unsigned int nest;
 
 	if (output_event->parent)
 		output_event = output_event->parent;
@@ -383,15 +404,18 @@ void *perf_aux_output_begin(struct perf_output_handle *handle,
 	if (!atomic_read(&rb->aux_mmap_count))
 		goto err;
 
-	if (!atomic_inc_not_zero(&rb->aux_refcount))
+	if (!refcount_inc_not_zero(&rb->aux_refcount))
 		goto err;
 
+	nest = READ_ONCE(rb->aux_nest);
 	/*
 	 * Nesting is not supported for AUX area, make sure nested
 	 * writers are caught early
 	 */
-	if (WARN_ON_ONCE(local_xchg(&rb->aux_nest, 1)))
+	if (WARN_ON_ONCE(nest))
 		goto err_put;
+
+	WRITE_ONCE(rb->aux_nest, nest + 1);
 
 	aux_head = rb->aux_head;
 
@@ -407,7 +431,7 @@ void *perf_aux_output_begin(struct perf_output_handle *handle,
 	 * (B) <-> (C) ordering is still observed by the pmu driver.
 	 */
 	if (!rb->aux_overwrite) {
-		aux_tail = ACCESS_ONCE(rb->user_page->aux_tail);
+		aux_tail = READ_ONCE(rb->user_page->aux_tail);
 		handle->wakeup = rb->aux_wakeup + rb->aux_watermark;
 		if (aux_head - aux_tail < perf_aux_size(rb))
 			handle->size = CIRC_SPACE(aux_head, aux_tail, perf_aux_size(rb));
@@ -418,9 +442,9 @@ void *perf_aux_output_begin(struct perf_output_handle *handle,
 		 * store that will be enabled on successful return
 		 */
 		if (!handle->size) { /* A, matches D */
-			event->pending_disable = 1;
+			event->pending_disable = smp_processor_id();
 			perf_output_wakeup(handle);
-			local_set(&rb->aux_nest, 0);
+			WRITE_ONCE(rb->aux_nest, 0);
 			goto err_put;
 		}
 	}
@@ -437,8 +461,9 @@ err:
 
 	return NULL;
 }
+EXPORT_SYMBOL_GPL(perf_aux_output_begin);
 
-static bool __always_inline rb_need_aux_wakeup(struct ring_buffer *rb)
+static __always_inline bool rb_need_aux_wakeup(struct perf_buffer *rb)
 {
 	if (rb->aux_overwrite)
 		return false;
@@ -464,7 +489,7 @@ static bool __always_inline rb_need_aux_wakeup(struct ring_buffer *rb)
 void perf_aux_output_end(struct perf_output_handle *handle, unsigned long size)
 {
 	bool wakeup = !!(handle->aux_flags & PERF_AUX_FLAG_TRUNCATED);
-	struct ring_buffer *rb = handle->rb;
+	struct perf_buffer *rb = handle->rb;
 	unsigned long aux_head;
 
 	/* in overwrite mode, driver provides aux_head via handle */
@@ -480,14 +505,21 @@ void perf_aux_output_end(struct perf_output_handle *handle, unsigned long size)
 		rb->aux_head += size;
 	}
 
-	if (size || handle->aux_flags) {
-		/*
-		 * Only send RECORD_AUX if we have something useful to communicate
-		 */
-
+	/*
+	 * Only send RECORD_AUX if we have something useful to communicate
+	 *
+	 * Note: the OVERWRITE records by themselves are not considered
+	 * useful, as they don't communicate any *new* information,
+	 * aside from the short-lived offset, that becomes history at
+	 * the next event sched-in and therefore isn't useful.
+	 * The userspace that needs to copy out AUX data in overwrite
+	 * mode should know to use user_page::aux_head for the actual
+	 * offset. So, from now on we don't output AUX records that
+	 * have *only* OVERWRITE flag set.
+	 */
+	if (size || (handle->aux_flags & ~(u64)PERF_AUX_FLAG_OVERWRITE))
 		perf_event_aux_event(handle->event, aux_head, size,
-		                     handle->aux_flags);
-	}
+				     handle->aux_flags);
 
 	WRITE_ONCE(rb->user_page->aux_head, rb->aux_head);
 	if (rb_need_aux_wakeup(rb))
@@ -495,17 +527,18 @@ void perf_aux_output_end(struct perf_output_handle *handle, unsigned long size)
 
 	if (wakeup) {
 		if (handle->aux_flags & PERF_AUX_FLAG_TRUNCATED)
-			handle->event->pending_disable = 1;
+			handle->event->pending_disable = smp_processor_id();
 		perf_output_wakeup(handle);
 	}
 
 	handle->event = NULL;
 
-	local_set(&rb->aux_nest, 0);
+	WRITE_ONCE(rb->aux_nest, 0);
 	/* can't be last */
 	rb_free_aux(rb);
 	ring_buffer_put(rb);
 }
+EXPORT_SYMBOL_GPL(perf_aux_output_end);
 
 /*
  * Skip over a given number of bytes in the AUX buffer, due to, for example,
@@ -513,7 +546,7 @@ void perf_aux_output_end(struct perf_output_handle *handle, unsigned long size)
  */
 int perf_aux_output_skip(struct perf_output_handle *handle, unsigned long size)
 {
-	struct ring_buffer *rb = handle->rb;
+	struct perf_buffer *rb = handle->rb;
 
 	if (size > handle->size)
 		return -ENOSPC;
@@ -531,6 +564,7 @@ int perf_aux_output_skip(struct perf_output_handle *handle, unsigned long size)
 
 	return 0;
 }
+EXPORT_SYMBOL_GPL(perf_aux_output_skip);
 
 void *perf_get_aux(struct perf_output_handle *handle)
 {
@@ -540,6 +574,43 @@ void *perf_get_aux(struct perf_output_handle *handle)
 
 	return handle->rb->aux_priv;
 }
+EXPORT_SYMBOL_GPL(perf_get_aux);
+
+/*
+ * Copy out AUX data from an AUX handle.
+ */
+long perf_output_copy_aux(struct perf_output_handle *aux_handle,
+			  struct perf_output_handle *handle,
+			  unsigned long from, unsigned long to)
+{
+	struct perf_buffer *rb = aux_handle->rb;
+	unsigned long tocopy, remainder, len = 0;
+	void *addr;
+
+	from &= (rb->aux_nr_pages << PAGE_SHIFT) - 1;
+	to &= (rb->aux_nr_pages << PAGE_SHIFT) - 1;
+
+	do {
+		tocopy = PAGE_SIZE - offset_in_page(from);
+		if (to > from)
+			tocopy = min(tocopy, to - from);
+		if (!tocopy)
+			break;
+
+		addr = rb->aux_pages[from >> PAGE_SHIFT];
+		addr += offset_in_page(from);
+
+		remainder = perf_output_copy(handle, addr, tocopy);
+		if (remainder)
+			return -EFAULT;
+
+		len += tocopy;
+		from += tocopy;
+		from &= (rb->aux_nr_pages << PAGE_SHIFT) - 1;
+	} while (to != from);
+
+	return len;
+}
 
 #define PERF_AUX_GFP	(GFP_KERNEL | __GFP_ZERO | __GFP_NOWARN | __GFP_NORETRY)
 
@@ -547,8 +618,8 @@ static struct page *rb_alloc_aux_page(int node, int order)
 {
 	struct page *page;
 
-	if (order > MAX_ORDER)
-		order = MAX_ORDER;
+	if (order > MAX_PAGE_ORDER)
+		order = MAX_PAGE_ORDER;
 
 	do {
 		page = alloc_pages_node(node, PERF_AUX_GFP, order);
@@ -569,7 +640,7 @@ static struct page *rb_alloc_aux_page(int node, int order)
 	return page;
 }
 
-static void rb_free_aux_page(struct ring_buffer *rb, int idx)
+static void rb_free_aux_page(struct perf_buffer *rb, int idx)
 {
 	struct page *page = virt_to_page(rb->aux_pages[idx]);
 
@@ -578,7 +649,7 @@ static void rb_free_aux_page(struct ring_buffer *rb, int idx)
 	__free_page(page);
 }
 
-static void __rb_free_aux(struct ring_buffer *rb)
+static void __rb_free_aux(struct perf_buffer *rb)
 {
 	int pg;
 
@@ -605,37 +676,62 @@ static void __rb_free_aux(struct ring_buffer *rb)
 	}
 }
 
-int rb_alloc_aux(struct ring_buffer *rb, struct perf_event *event,
+int rb_alloc_aux(struct perf_buffer *rb, struct perf_event *event,
 		 pgoff_t pgoff, int nr_pages, long watermark, int flags)
 {
 	bool overwrite = !(flags & RING_BUFFER_WRITABLE);
 	int node = (event->cpu == -1) ? -1 : cpu_to_node(event->cpu);
-	int ret = -ENOMEM, max_order = 0;
+	bool use_contiguous_pages = event->pmu->capabilities & (
+		PERF_PMU_CAP_AUX_NO_SG | PERF_PMU_CAP_AUX_PREFER_LARGE);
+	/*
+	 * Initialize max_order to 0 for page allocation. This allocates single
+	 * pages to minimize memory fragmentation. This is overridden if the
+	 * PMU needs or prefers contiguous pages (use_contiguous_pages = true).
+	 */
+	int max_order = 0;
+	int ret = -ENOMEM;
 
 	if (!has_aux(event))
 		return -EOPNOTSUPP;
 
-	if (event->pmu->capabilities & PERF_PMU_CAP_AUX_NO_SG) {
+	if (nr_pages <= 0)
+		return -EINVAL;
+
+	if (!overwrite) {
 		/*
-		 * We need to start with the max_order that fits in nr_pages,
-		 * not the other way around, hence ilog2() and not get_order.
+		 * Watermark defaults to half the buffer, to aid PMU drivers
+		 * in double buffering.
 		 */
-		max_order = ilog2(nr_pages);
+		if (!watermark)
+			watermark = min_t(unsigned long,
+					  U32_MAX,
+					  (unsigned long)nr_pages << (PAGE_SHIFT - 1));
 
 		/*
-		 * PMU requests more than one contiguous chunks of memory
-		 * for SW double buffering
+		 * If using contiguous pages, use aux_watermark as the basis
+		 * for chunking to help PMU drivers honor the watermark.
 		 */
-		if ((event->pmu->capabilities & PERF_PMU_CAP_AUX_SW_DOUBLEBUF) &&
-		    !overwrite) {
-			if (!max_order)
-				return -EINVAL;
-
-			max_order--;
-		}
+		if (use_contiguous_pages)
+			max_order = get_order(watermark);
+	} else {
+		/*
+		 * If using contiguous pages, we need to start with the
+		 * max_order that fits in nr_pages, not the other way around,
+		 * hence ilog2() and not get_order.
+		 */
+		if (use_contiguous_pages)
+			max_order = ilog2(nr_pages);
+		watermark = 0;
 	}
 
-	rb->aux_pages = kzalloc_node(nr_pages * sizeof(void *), GFP_KERNEL, node);
+	/*
+	 * kcalloc_node() is unable to allocate buffer if the size is larger
+	 * than: PAGE_SIZE << MAX_PAGE_ORDER; directly bail out in this case.
+	 */
+	if (get_order((unsigned long)nr_pages * sizeof(void *)) > MAX_PAGE_ORDER)
+		return -ENOMEM;
+	rb->aux_pages = kcalloc_node(nr_pages, sizeof(void *), GFP_KERNEL,
+				     node);
 	if (!rb->aux_pages)
 		return -ENOMEM;
 
@@ -668,7 +764,7 @@ int rb_alloc_aux(struct ring_buffer *rb, struct perf_event *event,
 			goto out;
 	}
 
-	rb->aux_priv = event->pmu->setup_aux(event->cpu, rb->aux_pages, nr_pages,
+	rb->aux_priv = event->pmu->setup_aux(event, rb->aux_pages, nr_pages,
 					     overwrite);
 	if (!rb->aux_priv)
 		goto out;
@@ -681,13 +777,10 @@ int rb_alloc_aux(struct ring_buffer *rb, struct perf_event *event,
 	 * we keep a refcount here to make sure either of the two can
 	 * reference them safely.
 	 */
-	atomic_set(&rb->aux_refcount, 1);
+	refcount_set(&rb->aux_refcount, 1);
 
 	rb->aux_overwrite = overwrite;
 	rb->aux_watermark = watermark;
-
-	if (!rb->aux_watermark && !rb->aux_overwrite)
-		rb->aux_watermark = nr_pages << (PAGE_SHIFT - 1);
 
 out:
 	if (!ret)
@@ -698,9 +791,9 @@ out:
 	return ret;
 }
 
-void rb_free_aux(struct ring_buffer *rb)
+void rb_free_aux(struct perf_buffer *rb)
 {
-	if (atomic_dec_and_test(&rb->aux_refcount))
+	if (refcount_dec_and_test(&rb->aux_refcount))
 		__rb_free_aux(rb);
 }
 
@@ -711,47 +804,79 @@ void rb_free_aux(struct ring_buffer *rb)
  */
 
 static struct page *
-__perf_mmap_to_page(struct ring_buffer *rb, unsigned long pgoff)
+__perf_mmap_to_page(struct perf_buffer *rb, unsigned long pgoff)
 {
-	if (pgoff > rb->nr_pages)
+	int metadata_pages = __PAGE_SIZE / PAGE_SIZE;
+
+	/* Use '>=' since we explicitly include the user/metadata page(s). */
+	if (pgoff >= rb->nr_pages + metadata_pages)
 		return NULL;
 
-	if (pgoff == 0)
-		return virt_to_page(rb->user_page);
+	if (pgoff < metadata_pages)
+		return virt_to_page(rb->user_page + pgoff * PAGE_SIZE);
 
-	return virt_to_page(rb->data_pages[pgoff - 1]);
+	return virt_to_page(rb->data_pages[pgoff - metadata_pages]);
 }
 
-static void *perf_mmap_alloc_page(int cpu)
+static void *__perf_mmap_alloc(int cpu, int order)
 {
 	struct page *page;
 	int node;
 
 	node = (cpu == -1) ? cpu : cpu_to_node(cpu);
-	page = alloc_pages_node(node, GFP_KERNEL | __GFP_ZERO, 0);
+	page = alloc_pages_node(node, GFP_KERNEL | __GFP_ZERO, order);
 	if (!page)
 		return NULL;
 
 	return page_address(page);
 }
 
-struct ring_buffer *rb_alloc(int nr_pages, long watermark, int cpu, int flags)
+static void __perf_mmap_free(void *addr, int order)
 {
-	struct ring_buffer *rb;
-	unsigned long size;
-	int i;
+	struct page *page = virt_to_page(addr);
 
-	size = sizeof(struct ring_buffer);
+	page->mapping = NULL;
+	__free_pages(page, order);
+}
+
+static void *perf_mmap_alloc_page(int cpu)
+{
+	return __perf_mmap_alloc(cpu, 0);
+}
+
+static void perf_mmap_free_page(void *addr)
+{
+	__perf_mmap_free(addr, 0);
+}
+
+static inline void *perf_mmap_alloc_metadata_page(int cpu)
+{
+	return __perf_mmap_alloc(cpu, get_order(__PAGE_SIZE));
+}
+
+static inline void perf_mmap_free_metadata_page(void *addr)
+{
+	__perf_mmap_free(addr, get_order(__PAGE_SIZE));
+}
+
+struct perf_buffer *rb_alloc(int nr_pages, long watermark, int cpu, int flags)
+{
+	struct perf_buffer *rb;
+	unsigned long size;
+	int i, node;
+
+	size = sizeof(struct perf_buffer);
 	size += nr_pages * sizeof(void *);
 
-	if (order_base_2(size) >= PAGE_SHIFT+MAX_ORDER)
+	if (order_base_2(size) > PAGE_SHIFT+MAX_PAGE_ORDER)
 		goto fail;
 
-	rb = kzalloc(size, GFP_KERNEL);
+	node = (cpu == -1) ? cpu : cpu_to_node(cpu);
+	rb = kzalloc_node(size, GFP_KERNEL, node);
 	if (!rb)
 		goto fail;
 
-	rb->user_page = perf_mmap_alloc_page(cpu);
+	rb->user_page = perf_mmap_alloc_metadata_page(cpu);
 	if (!rb->user_page)
 		goto fail_user_page;
 
@@ -769,9 +894,9 @@ struct ring_buffer *rb_alloc(int nr_pages, long watermark, int cpu, int flags)
 
 fail_data_pages:
 	for (i--; i >= 0; i--)
-		free_page((unsigned long)rb->data_pages[i]);
+		perf_mmap_free_page(rb->data_pages[i]);
 
-	free_page((unsigned long)rb->user_page);
+	perf_mmap_free_metadata_page(rb->user_page);
 
 fail_user_page:
 	kfree(rb);
@@ -780,35 +905,24 @@ fail:
 	return NULL;
 }
 
-static void perf_mmap_free_page(unsigned long addr)
-{
-	struct page *page = virt_to_page((void *)addr);
-
-	page->mapping = NULL;
-	__free_page(page);
-}
-
-void rb_free(struct ring_buffer *rb)
+void rb_free(struct perf_buffer *rb)
 {
 	int i;
 
-	perf_mmap_free_page((unsigned long)rb->user_page);
+	perf_mmap_free_metadata_page(rb->user_page);
 	for (i = 0; i < rb->nr_pages; i++)
-		perf_mmap_free_page((unsigned long)rb->data_pages[i]);
+		perf_mmap_free_page(rb->data_pages[i]);
 	kfree(rb);
 }
 
 #else
-static int data_page_nr(struct ring_buffer *rb)
-{
-	return rb->nr_pages << page_order(rb);
-}
-
 static struct page *
-__perf_mmap_to_page(struct ring_buffer *rb, unsigned long pgoff)
+__perf_mmap_to_page(struct perf_buffer *rb, unsigned long pgoff)
 {
-	/* The '>' counts in the user page. */
-	if (pgoff > data_page_nr(rb))
+	int metadata_pages = __PAGE_SIZE / PAGE_SIZE;
+
+	/* Use '>=' since we explicitly add the user/metadata page(s). */
+	if (pgoff >= data_page_nr(rb) + metadata_pages)
 		return NULL;
 
 	return vmalloc_to_page((void *)rb->user_page + pgoff * PAGE_SIZE);
@@ -823,48 +937,52 @@ static void perf_mmap_unmark_page(void *addr)
 
 static void rb_free_work(struct work_struct *work)
 {
-	struct ring_buffer *rb;
+	int metadata_pages = __PAGE_SIZE / PAGE_SIZE;
+	struct perf_buffer *rb;
 	void *base;
 	int i, nr;
 
-	rb = container_of(work, struct ring_buffer, work);
+	rb = container_of(work, struct perf_buffer, work);
 	nr = data_page_nr(rb);
 
 	base = rb->user_page;
-	/* The '<=' counts in the user page. */
-	for (i = 0; i <= nr; i++)
+	/* Use '<' since we explicitly include the user/metadata page(s). */
+	for (i = 0; i < nr + metadata_pages; i++)
 		perf_mmap_unmark_page(base + (i * PAGE_SIZE));
 
 	vfree(base);
 	kfree(rb);
 }
 
-void rb_free(struct ring_buffer *rb)
+void rb_free(struct perf_buffer *rb)
 {
 	schedule_work(&rb->work);
 }
 
-struct ring_buffer *rb_alloc(int nr_pages, long watermark, int cpu, int flags)
+struct perf_buffer *rb_alloc(int nr_pages, long watermark, int cpu, int flags)
 {
-	struct ring_buffer *rb;
+	struct perf_buffer *rb;
 	unsigned long size;
 	void *all_buf;
+	int node;
+	int metadata_pages = __PAGE_SIZE / PAGE_SIZE;
 
-	size = sizeof(struct ring_buffer);
+	size = sizeof(struct perf_buffer);
 	size += sizeof(void *);
 
-	rb = kzalloc(size, GFP_KERNEL);
+	node = (cpu == -1) ? cpu : cpu_to_node(cpu);
+	rb = kzalloc_node(size, GFP_KERNEL, node);
 	if (!rb)
 		goto fail;
 
 	INIT_WORK(&rb->work, rb_free_work);
 
-	all_buf = vmalloc_user((nr_pages + 1) * PAGE_SIZE);
+	all_buf = vmalloc_user((nr_pages + metadata_pages) * PAGE_SIZE);
 	if (!all_buf)
 		goto fail_all_buf;
 
 	rb->user_page = all_buf;
-	rb->data_pages[0] = all_buf + PAGE_SIZE;
+	rb->data_pages[0] = all_buf + __PAGE_SIZE;
 	if (nr_pages) {
 		rb->nr_pages = 1;
 		rb->page_order = ilog2(nr_pages);
@@ -884,7 +1002,7 @@ fail:
 #endif
 
 struct page *
-perf_mmap_to_page(struct ring_buffer *rb, unsigned long pgoff)
+perf_mmap_to_page(struct perf_buffer *rb, unsigned long pgoff)
 {
 	if (rb->aux_nr_pages) {
 		/* above AUX space */

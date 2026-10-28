@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Sony Programmable I/O Control Device driver for VAIO
  *
@@ -18,21 +19,6 @@
  * Copyright (C) 2000 Andrew Tridgell <tridge@valinux.com>
  *
  * Earlier work by Werner Almesberger, Paul `Rusty' Russell and Paul Mackerras.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
- *
  */
 
 #include <linux/module.h>
@@ -934,17 +920,17 @@ static ssize_t sonypi_misc_read(struct file *file, char __user *buf,
 
 	if (ret > 0) {
 		struct inode *inode = file_inode(file);
-		inode->i_atime = current_time(inode);
+		inode_set_atime_to_ts(inode, current_time(inode));
 	}
 
 	return ret;
 }
 
-static unsigned int sonypi_misc_poll(struct file *file, poll_table *wait)
+static __poll_t sonypi_misc_poll(struct file *file, poll_table *wait)
 {
 	poll_wait(file, &sonypi_device.fifo_proc_list, wait);
 	if (kfifo_len(&sonypi_device.fifo))
-		return POLLIN | POLLRDNORM;
+		return EPOLLIN | EPOLLRDNORM;
 	return 0;
 }
 
@@ -1068,7 +1054,6 @@ static const struct file_operations sonypi_misc_fops = {
 	.release	= sonypi_misc_release,
 	.fasync		= sonypi_misc_fasync,
 	.unlocked_ioctl	= sonypi_misc_ioctl,
-	.llseek		= no_llseek,
 };
 
 static struct miscdevice sonypi_misc_device = {
@@ -1137,10 +1122,9 @@ static int sonypi_acpi_add(struct acpi_device *device)
 	return 0;
 }
 
-static int sonypi_acpi_remove(struct acpi_device *device)
+static void sonypi_acpi_remove(struct acpi_device *device)
 {
 	sonypi_acpi_device = NULL;
-	return 0;
 }
 
 static const struct acpi_device_id sonypi_device_ids[] = {
@@ -1423,7 +1407,7 @@ static int sonypi_probe(struct platform_device *dev)
 	return error;
 }
 
-static int sonypi_remove(struct platform_device *dev)
+static void sonypi_remove(struct platform_device *dev)
 {
 	sonypi_disable();
 
@@ -1447,8 +1431,6 @@ static int sonypi_remove(struct platform_device *dev)
 	}
 
 	kfifo_free(&sonypi_device.fifo);
-
-	return 0;
 }
 
 #ifdef CONFIG_PM_SLEEP
@@ -1485,7 +1467,7 @@ static struct platform_driver sonypi_driver = {
 		.pm	= SONYPI_PM,
 	},
 	.probe		= sonypi_probe,
-	.remove		= sonypi_remove,
+	.remove_new	= sonypi_remove,
 	.shutdown	= sonypi_shutdown,
 };
 

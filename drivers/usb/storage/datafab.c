@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0+
 /*
  * Driver for Datafab USB Compact Flash reader
  *
@@ -18,20 +19,6 @@
  *
  * Other contributors:
  *   (c) 2002 Alan Stern <stern@rowland.org>
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU General Public License as published by the
- * Free Software Foundation; either version 2, or (at your option) any
- * later version.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License along
- * with this program; if not, write to the Free Software Foundation, Inc.,
- * 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
 /*
@@ -67,6 +54,7 @@
 MODULE_DESCRIPTION("Driver for Datafab USB Compact Flash reader");
 MODULE_AUTHOR("Jimmie Mayfield <mayfield+datafab@sackheads.org>");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS(USB_STORAGE);
 
 struct datafab_info {
 	unsigned long   sectors;	/* total sector count */
@@ -92,7 +80,7 @@ static int datafab_determine_lun(struct us_data *us,
 { USB_DEVICE_VER(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax), \
   .driver_info = (flags) }
 
-static struct usb_device_id datafab_usb_ids[] = {
+static const struct usb_device_id datafab_usb_ids[] = {
 #	include "unusual_datafab.h"
 	{ }		/* Terminating entry */
 };
@@ -114,7 +102,7 @@ MODULE_DEVICE_TABLE(usb, datafab_usb_ids);
 	.initFunction = init_function,	\
 }
 
-static struct us_unusual_dev datafab_unusual_dev_list[] = {
+static const struct us_unusual_dev datafab_unusual_dev_list[] = {
 #	include "unusual_datafab.h"
 	{ }		/* Terminating entry */
 };
@@ -306,7 +294,6 @@ static int datafab_write_data(struct us_data *us,
 		if (reply[0] != 0x50 && reply[1] != 0) {
 			usb_stor_dbg(us, "Gah! write return code: %02x %02x\n",
 				     reply[0], reply[1]);
-			result = USB_STOR_TRANSPORT_ERROR;
 			goto leave;
 		}
 

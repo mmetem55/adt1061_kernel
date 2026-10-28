@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Recognize and maintain s390 storage class memory.
  *
@@ -27,20 +28,21 @@ static int scmdev_probe(struct device *dev)
 	return scmdrv->probe ? scmdrv->probe(scmdev) : -ENODEV;
 }
 
-static int scmdev_remove(struct device *dev)
+static void scmdev_remove(struct device *dev)
 {
 	struct scm_device *scmdev = to_scm_dev(dev);
 	struct scm_driver *scmdrv = to_scm_drv(dev->driver);
 
-	return scmdrv->remove ? scmdrv->remove(scmdev) : -ENODEV;
+	if (scmdrv->remove)
+		scmdrv->remove(scmdev);
 }
 
-static int scmdev_uevent(struct device *dev, struct kobj_uevent_env *env)
+static int scmdev_uevent(const struct device *dev, struct kobj_uevent_env *env)
 {
 	return add_uevent_var(env, "MODALIAS=scm:scmdev");
 }
 
-static struct bus_type scm_bus_type = {
+static const struct bus_type scm_bus_type = {
 	.name  = "scm",
 	.probe = scmdev_probe,
 	.remove = scmdev_remove,
@@ -173,10 +175,10 @@ out:
 		kobject_uevent(&scmdev->dev.kobj, KOBJ_CHANGE);
 }
 
-static int check_address(struct device *dev, void *data)
+static int check_address(struct device *dev, const void *data)
 {
 	struct scm_device *scmdev = to_scm_dev(dev);
-	struct sale *sale = data;
+	const struct sale *sale = data;
 
 	return scmdev->address == sale->sa;
 }

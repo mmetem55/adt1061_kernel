@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  *
  * Hardware accelerated Matrox Millennium I, II, Mystique, G100, G200, G400 and G450.
@@ -1110,4 +1111,5 @@ EXPORT_SYMBOL(matrox_G100);
 EXPORT_SYMBOL(DAC1064_global_init);
 EXPORT_SYMBOL(DAC1064_global_restore);
 #endif
+MODULE_DESCRIPTION("Matrox Mystique/G100 output driver");
 MODULE_LICENSE("GPL");

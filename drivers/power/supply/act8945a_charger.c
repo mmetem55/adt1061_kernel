@@ -1,14 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Power supply driver for the Active-semi ACT8945A PMIC
  *
  * Copyright (C) 2015 Atmel Corporation
  *
  * Author: Wenyou Yang <wenyou.yang@atmel.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- *
  */
 #include <linux/interrupt.h>
 #include <linux/module.h>
@@ -22,7 +18,7 @@
 static const char *act8945a_charger_model = "ACT8945A";
 static const char *act8945a_charger_manufacturer = "Active-semi";
 
-/**
+/*
  * ACT8945A Charger Register Map
  */
 
@@ -601,14 +597,6 @@ static int act8945a_charger_probe(struct platform_device *pdev)
 		return irq ?: -ENXIO;
 	}
 
-	ret = devm_request_irq(&pdev->dev, irq, act8945a_status_changed,
-			       IRQF_TRIGGER_FALLING, "act8945a_interrupt",
-			       charger);
-	if (ret) {
-		dev_err(&pdev->dev, "failed to request nIRQ pin IRQ\n");
-		return ret;
-	}
-
 	charger->desc.name = "act8945a-charger";
 	charger->desc.get_property = act8945a_charger_get_property;
 	charger->desc.properties = act8945a_charger_props;
@@ -629,6 +617,14 @@ static int act8945a_charger_probe(struct platform_device *pdev)
 		return PTR_ERR(charger->psy);
 	}
 
+	ret = devm_request_irq(&pdev->dev, irq, act8945a_status_changed,
+			       IRQF_TRIGGER_FALLING, "act8945a_interrupt",
+			       charger);
+	if (ret) {
+		dev_err(&pdev->dev, "failed to request nIRQ pin IRQ\n");
+		return ret;
+	}
+
 	platform_set_drvdata(pdev, charger);
 
 	INIT_WORK(&charger->work, act8945a_work);
@@ -642,14 +638,12 @@ static int act8945a_charger_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int act8945a_charger_remove(struct platform_device *pdev)
+static void act8945a_charger_remove(struct platform_device *pdev)
 {
 	struct act8945a_charger *charger = platform_get_drvdata(pdev);
 
 	charger->init_done = false;
 	cancel_work_sync(&charger->work);
-
-	return 0;
 }
 
 static struct platform_driver act8945a_charger_driver = {
@@ -657,7 +651,7 @@ static struct platform_driver act8945a_charger_driver = {
 		.name = "act8945a-charger",
 	},
 	.probe	= act8945a_charger_probe,
-	.remove = act8945a_charger_remove,
+	.remove_new = act8945a_charger_remove,
 };
 module_platform_driver(act8945a_charger_driver);
 

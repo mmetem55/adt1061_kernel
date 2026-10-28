@@ -1,156 +1,73 @@
-# How do I submit patches to Android Common Kernels
+# Aidata ADT1061 (Unisoc UMS512 / sharkl5pro) Android GKI 6.12.93 Linux Kernel
 
-1. BEST: Make all of your changes to upstream Linux. If appropriate, backport to the stable releases.
-   These patches will be merged automatically in the corresponding common kernels. If the patch is already
-   in upstream Linux, post a backport of the patch that conforms to the patch requirements below.
-   - Do not send patches upstream that contain only symbol exports. To be considered for upstream Linux,
-additions of `EXPORT_SYMBOL_GPL()` require an in-tree modular driver that uses the symbol -- so include
-the new driver or changes to an existing driver in the same patchset as the export.
-   - When sending patches upstream, the commit message must contain a clear case for why the patch
-is needed and beneficial to the community. Enabling out-of-tree drivers or functionality is not
-a persuasive case.
+Unisoc UMS512 vendor **4.14.133** çekirdeğinin,
+**Android Common Kernel (GKI) 6.12.93** üzerine portudur.
 
-2. LESS GOOD: Develop your patches out-of-tree (from an upstream Linux point-of-view). Unless these are
-   fixing an Android-specific bug, these are very unlikely to be accepted unless they have been
-   coordinated with kernel-team@android.com. If you want to proceed, post a patch that conforms to the
-   patch requirements below.
+Bu depo bir ACK `common/` ağacıdır. **GKI çekirdeğine dokunulmaz** (`Image` değişmez); vendor sürücüleri
+Kleaf/Bazel **DDK modülü** olarak `adt1061/modules/` altında derlenir, cihaz ağacı (DT) ise
+`arch/arm64/boot/dts/sprd/` altındadır.
 
-# Common Kernel patch requirements
+## Durum özeti
 
-- All patches must conform to the Linux kernel coding standards and pass `scripts/checkpatch.pl`
-- Patches shall not break gki_defconfig or allmodconfig builds for arm, arm64, x86, x86_64 architectures
-(see  https://source.android.com/setup/build/building-kernels)
-- If the patch is not merged from an upstream branch, the subject must be tagged with the type of patch:
-`UPSTREAM:`, `BACKPORT:`, `FROMGIT:`, `FROMLIST:`, or `ANDROID:`.
-- All patches must have a `Change-Id:` tag (see https://gerrit-review.googlesource.com/Documentation/user-changeid.html)
-- If an Android bug has been assigned, there must be a `Bug:` tag.
-- All patches must have a `Signed-off-by:` tag by the author and the submitter
+| Alan | Durum |
+|---|---|
+| 8 çekirdek SMP, GIC, arch timer, seri konsol (ttyS1) | Çalışıyor |
+| eMMC / SD / SDIO | Çalışıyor |
+| Ekran (DPU/DSI, 1200x1920@58) | Çalışıyor |
+| GPU Mali-G52 MP2 | Çalışıyor — vendor Mali yerine açık kaynak **Panfrost** |
+| WiFi (SC2355) | Çalışıyor — `probe_ie=0` zorunlu (aşağıya bakın); yalnız 2,4 GHz sınandı |
+| RTC (SC2730) | Çalışıyor |
+| CPU DVFS (iki küme ayrı: CPU0-5 / CPU6-7) | Çalışıyor |
+| CPU termal kısma (`sprd_cpu_cooling`) | Çalışıyor — GKI'da `power_allocator` yok, `step_wise` ile 85 °C'de devreye girer |
+| Şarj, fuel gauge, PMIC (SC2730), USB, ses, BT/FM | Sürücü bağlı, test edilmedi |
+| Kamera zinciri, sensorhub/CM4, Trusty/TEE, parmak izi, CoreSight | henüz modül olarak eklenmedi |
+| Modem | IPC sürücüleri bağlı, CP boot edilmiyor |
+| CPU derin uyku | Kapalı — DTB'de idle parametresi `0`; açıkken erken açılışta donuyor, hatanın sebebi henüz bulunamadı |
 
-Additional requirements are listed below based on patch type
+## Depo yapısı
 
-## Requirements for backports from mainline Linux: `UPSTREAM:`, `BACKPORT:`
-
-- If the patch is a cherry-pick from Linux mainline with no changes at all
-    - tag the patch subject with `UPSTREAM:`.
-    - add upstream commit information with a `(cherry picked from commit ...)` line
-    - Example:
-        - if the upstream commit message is
 ```
-        important patch from upstream
-
-        This is the detailed description of the important patch
-
-        Signed-off-by: Fred Jones <fred.jones@foo.org>
-```
->- then Joe Smith would upload the patch for the common kernel as
-```
-        UPSTREAM: important patch from upstream
-
-        This is the detailed description of the important patch
-
-        Signed-off-by: Fred Jones <fred.jones@foo.org>
-
-        Bug: 135791357
-        Change-Id: I4caaaa566ea080fa148c5e768bb1a0b6f7201c01
-        (cherry picked from commit c31e73121f4c1ec41143423ac6ce3ce6dafdcec1)
-        Signed-off-by: Joe Smith <joe.smith@foo.org>
+adt1061/
+  BUILD.bazel          kernel_build(adt1061_kernel): base_kernel=//common:kernel_aarch64, DTB hedefi
+  adt1061.fragment     defconfig eki
+  keys/                modül imzalama anahtarı
+  modules/
+    BUILD.bazel        her modül için ddk_module + kernel_module_group(adt1061_modules)
+    sprd_*/            vendor SoC sürücüleri (6.12 API'sine uyarlanmış)
+    panfrost/ gpu_sched/   GPU (Panfrost + DRM scheduler modül olarak)
+    snd_soc_sprd/      ses
+arch/arm64/boot/dts/sprd/
+  adt1061.dts, aidata-sharkl5Pro.dtsi, aidata-ums512.dtsi, sc2730.dtsi, lcd/ ...
 ```
 
-- If the patch requires any changes from the upstream version, tag the patch with `BACKPORT:`
-instead of `UPSTREAM:`.
-    - use the same tags as `UPSTREAM:`
-    - add comments about the changes under the `(cherry picked from commit ...)` line
-    - Example:
-```
-        BACKPORT: important patch from upstream
+Önemli notlar:
 
-        This is the detailed description of the important patch
+- **`sprd_wlan`:** SC2355 firmware'i 128 baytı aşan probe-request IE'si ile çöker. `probe_ie` modül parametresi
+  varsayılan `0`'dır (IE gönderilmez); taramaların çalışması için bu gereklidir.
+- **U-Boot** `boot.img` komut satırını yok sayar; çekirdek parametrelerini değil DTB'yi (`/chosen`) düzenleyin.
 
-        Signed-off-by: Fred Jones <fred.jones@foo.org>
+- **Upstream U-Boot** ile --kernel_offset 0x80080000, --ramdisk_offset 0x88000000, --dtb_offset 0x89000000 böyle olmalıdır stok U-Boot ile ise --kernel_offset 0x00008000, --ramdisk_offset 0x05400000, --dtb_offset 0x01204800 olmalıdır.
 
-        Bug: 135791357
-        Change-Id: I4caaaa566ea080fa148c5e768bb1a0b6f7201c01
-        (cherry picked from commit c31e73121f4c1ec41143423ac6ce3ce6dafdcec1)
-        [joe: Resolved minor conflict in drivers/foo/bar.c ]
-        Signed-off-by: Joe Smith <joe.smith@foo.org>
-```
+## Derleme
 
-## Requirements for other backports: `FROMGIT:`, `FROMLIST:`,
+Ağaç, standart Android çekirdek (Kleaf) kaynak ağacında `common/` olarak bulunmalıdır
+(ör. `android16-6.12` manifesti; bu depo `common/` dizinine klonlanır).
 
-- If the patch has been merged into an upstream maintainer tree, but has not yet
-been merged into Linux mainline
-    - tag the patch subject with `FROMGIT:`
-    - add info on where the patch came from as `(cherry picked from commit <sha1> <repo> <branch>)`. This
-must be a stable maintainer branch (not rebased, so don't use `linux-next` for example).
-    - if changes were required, use `BACKPORT: FROMGIT:`
-    - Example:
-        - if the commit message in the maintainer tree is
-```
-        important patch from upstream
-
-        This is the detailed description of the important patch
-
-        Signed-off-by: Fred Jones <fred.jones@foo.org>
-```
->- then Joe Smith would upload the patch for the common kernel as
-```
-        FROMGIT: important patch from upstream
-
-        This is the detailed description of the important patch
-
-        Signed-off-by: Fred Jones <fred.jones@foo.org>
-
-        Bug: 135791357
-        (cherry picked from commit 878a2fd9de10b03d11d2f622250285c7e63deace
-         https://git.kernel.org/pub/scm/linux/kernel/git/foo/bar.git test-branch)
-        Change-Id: I4caaaa566ea080fa148c5e768bb1a0b6f7201c01
-        Signed-off-by: Joe Smith <joe.smith@foo.org>
+```bash
+# kaynak ağacın kökünden (common/ = bu depo)
+tools/bazel build //common/adt1061/modules:adt1061_modules        # tüm modüller
+tools/bazel build //common/adt1061/modules:sprd_gpu_pd           # tek modül
+tools/bazel build //common/adt1061:adt1061_kernel                # DTB (adt1061.dtb)
+tools/bazel build //common/adt1061/modules:adt1061_modules_install
 ```
 
+- `adt1061/keys/signing_key.pem` yalnız geliştirme amaçlı bir modül imzalama anahtarıdır
 
-- If the patch has been submitted to LKML, but not accepted into any maintainer tree
-    - tag the patch subject with `FROMLIST:`
-    - add a `Link:` tag with a link to the submittal on lore.kernel.org
-    - add a `Bug:` tag with the Android bug (required for patches not accepted into
-a maintainer tree)
-    - if changes were required, use `BACKPORT: FROMLIST:`
-    - Example:
-```
-        FROMLIST: important patch from upstream
+Cihaza yazmadan önce yedek alın; bu depo henüz deneysel aşamadadır.
 
-        This is the detailed description of the important patch
+## Bilinen sorunlar
 
-        Signed-off-by: Fred Jones <fred.jones@foo.org>
-
-        Bug: 135791357
-        Link: https://lore.kernel.org/lkml/20190619171517.GA17557@someone.com/
-        Change-Id: I4caaaa566ea080fa148c5e768bb1a0b6f7201c01
-        Signed-off-by: Joe Smith <joe.smith@foo.org>
-```
-
-- If a patch has been submitted to the community, but rejected, do NOT use the
-  `FROMLIST:` tag to try to hide this fact.  Use the `ANDROID:` tag as
-  described below as this must be considered as an Android-specific submission,
-  not an upstream submission as the community will not accept these changes
-  as-is.
-
-## Requirements for Android-specific patches: `ANDROID:`
-
-- If the patch is fixing a bug to Android-specific code
-    - tag the patch subject with `ANDROID:`
-    - add a `Fixes:` tag that cites the patch with the bug
-    - Example:
-```
-        ANDROID: fix android-specific bug in foobar.c
-
-        This is the detailed description of the important fix
-
-        Fixes: 1234abcd2468 ("foobar: add cool feature")
-        Change-Id: I4caaaa566ea080fa148c5e768bb1a0b6f7201c01
-        Signed-off-by: Joe Smith <joe.smith@foo.org>
-```
-
-- If the patch is a new feature
-    - tag the patch subject with `ANDROID:`
-    - add a `Bug:` tag with the Android bug (required for android-specific features)
-
+- CPU derin uyku (PSCI `0x10000`) açıldığında çekirdek ~2 sn'de sessizce donuyor; DTB'de `arm,psci-suspend-param = 0`.
+- CPU hotplug/çekirdek izolasyonu soğutma için portlanmadı (`sprd_core_ctl` izolasyonu henüz tam değil).
+- Modem CP, kamera, sensorhub, Trusty henüz eklenmedi.
+- WiFi 5 GHz ve Bluetooth/FM/ses işlevleri test edilmedi.
